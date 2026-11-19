@@ -4,6 +4,7 @@ import sys
 from contextlib import closing
 from html import escape
 from pathlib import Path
+from time import monotonic
 
 # QGIS에 포함된 Windows Python에서 SQLite DLL을 찾을 수 있게 합니다.
 qgis_folder = Path(sys.base_prefix).parent.parent
@@ -19,7 +20,7 @@ from catalog import Book, MOOD_ROUTES, ROUTE_REASONS, match_route_keywords, norm
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
 from catalog import EDITION_NOTES, book_isbn, google_book_intro, yes24_book_text
 from catalog import load_yes24_key, save_yes24_key, yes24_key_path
-from catalog import search_books
+from catalog import build_search_index, search_books
 
 
 TITLE = "책 한 권으로 시작하는 올림픽공원 산책"
@@ -89,24 +90,34 @@ def update_catalog(snapshot_path):
             CATALOG_DOWNLOAD_LOCK.release()
 
 
-def collect_book_documents(book, google_key, yes24_key, lookup_status):
+def collect_book_documents(book, google_key, yes24_key, lookup_status, external_lookup):
     isbn = book_isbn(book)
     cache = st.session_state.setdefault("book_intro_recommendations", {})
     documents = [("지샘터 책 소개", book.description)]
     source_links = {}
     sections = []
-    if not yes24_key:
+    if not external_lookup:
+        lookup_status.caption("외부 책 소개 조회를 끈 상태예요.")
+    elif not yes24_key:
         lookup_status.caption("YES24 API 미조회 · API 키가 설정되지 않았어요.")
     elif not isbn:
         lookup_status.caption("YES24 API 미조회 · 장서 정보에서 유효한 ISBN을 확인할 수 없어요.")
     else:
         cache_key = ("yes24-text", isbn)
-        if cache_key not in cache:
+        error_key = ("yes24-error", isbn)
+        retry_at, error_message = cache.get(error_key, (0, ""))
+        if retry_at > monotonic():
+            lookup_status.caption(f"YES24 API 조회 오류 · {error_message}")
+        elif cache_key not in cache:
             try:
                 with st.spinner("YES24에서 같은 ISBN의 책을 찾고 있어요."):
                     cache[cache_key] = yes24_book_text(isbn, yes24_key)
             except CatalogError as error:
-                lookup_status.caption(f"YES24 API 조회 오류 · {error}")
+                error_message = str(error)
+                cache[error_key] = (monotonic() + 30, error_message)
+                lookup_status.caption(f"YES24 API 조회 오류 · {error_message}")
+            else:
+                cache.pop(error_key, None)
         if cache_key in cache:
             sections, link, matched = cache[cache_key]
             if sections:
@@ -125,7 +136,7 @@ def collect_book_documents(book, google_key, yes24_key, lookup_status):
         text, link, source = note
         documents.append((source, text))
         source_links[source] = link
-    if isbn and google_key and not sections:
+    if external_lookup and isbn and google_key and not sections:
         cache_key = ("google-text", isbn)
         if cache_key not in cache:
             try:
@@ -148,13 +159,6 @@ def show_book_recommendation(folder, demo_books, routes):
     xml_folder = folder / "catalog"
     snapshot = xml_folder / "ksponco-api.xml"
     update_catalog(snapshot)
-    paths = sorted(path for path in xml_folder.glob("*.xml") if path.is_file())
-    try:
-        files = [path.read_bytes() for path in paths]
-    except OSError:
-        st.error("catalog 폴더의 XML 파일을 읽을 수 없어요.")
-        files = []
-
     with st.expander("공공데이터 XML 가져오기"):
         st.markdown(
             "올림픽공원 도서정보 API의 응답 여러 페이지를 XML 파일로 올리거나 "
@@ -162,14 +166,24 @@ def show_book_recommendation(folder, demo_books, routes):
         )
         st.markdown(f"[공공데이터포털 · 도서정보 15008517]({DATASET_URL})")
         uploads = st.file_uploader("도서 목록 XML", type="xml", accept_multiple_files=True)
-    files += [upload.getvalue() for upload in uploads]
+    files = tuple(upload.getvalue() for upload in uploads)
     preview = st.session_state.get("catalog_api_preview")
     if preview is not None:
         if st.button("테스트 목록 닫기"):
             st.session_state.pop("catalog_api_preview")
             st.rerun()
-        files = [preview]
-    books, invalid_files = cached_catalog(tuple(files))
+        books, invalid_files, search_index = cached_catalog((), (preview,))
+    else:
+        try:
+            paths = []
+            for path in sorted(xml_folder.glob("*.xml")):
+                if path.is_file():
+                    info = path.stat()
+                    paths.append((str(path), info.st_mtime_ns, info.st_size))
+            books, invalid_files, search_index = cached_catalog(tuple(paths), files)
+        except OSError:
+            st.error("catalog 폴더의 XML 파일을 읽을 수 없어요.")
+            books, invalid_files, search_index = cached_catalog((), files)
 
     if invalid_files:
         st.warning(
@@ -180,6 +194,7 @@ def show_book_recommendation(folder, demo_books, routes):
     source_is_xml = bool(books)
     if not source_is_xml:
         books = demo_books
+        search_index = build_search_index(books)
         st.info("현재는 기존 10권으로 체험 중이에요. 전체 검색은 API 응답 XML을 불러온 범위에서 제공돼요.")
     else:
         st.caption(f"불러온 도서 {len(books):,}권 · 출처: 올림픽공원 도서정보 API (15008517)")
@@ -201,7 +216,12 @@ def show_book_recommendation(folder, demo_books, routes):
             with button_column:
                 st.form_submit_button("검색")
         query = normalized(search_text)
-        matches, search_message = search_books(books, search_text)
+        previous = st.session_state.get("last_catalog_search")
+        if previous and previous[0] is books and previous[1] == search_text:
+            matches, search_message = previous[2]
+        else:
+            matches, search_message = search_books(books, search_text, search_index)
+            st.session_state["last_catalog_search"] = (books, search_text, (matches, search_message))
         from_catalog = bool(matches)
         if from_catalog:
             if search_message:
@@ -304,6 +324,7 @@ def show_book_recommendation(folder, demo_books, routes):
                 st.session_state.pop("yes24_book_api_key", None)
                 st.session_state.pop("book_intro_recommendations", None)
                 st.rerun()
+        external_lookup = st.toggle("외부 책 소개 자동 조회", value=True)
         lookup_details = st.container()
     yes24_key = (
         st.session_state.get("yes24_book_api_key") or saved_yes24_key or server_yes24_key
@@ -337,7 +358,9 @@ def show_book_recommendation(folder, demo_books, routes):
         if from_catalog:
             lookup_status = st.empty()
             with lookup_details:
-                book_documents, source_links = collect_book_documents(book, google_key, yes24_key, lookup_status)
+                book_documents, source_links = collect_book_documents(
+                    book, google_key, yes24_key, lookup_status, external_lookup
+                )
             documents.extend(book_documents)
         matches = match_route_keywords(documents, routes)
         used_metadata = not any(matches.values())
@@ -378,9 +401,11 @@ def show_book_recommendation(folder, demo_books, routes):
     return name, distance, feature_id, reason
 
 
-@st.cache_data(show_spinner=False)
-def cached_catalog(files):
-    return read_catalog(files)
+@st.cache_resource(show_spinner=False, max_entries=4)
+def cached_catalog(paths, uploads):
+    files = [Path(path).read_bytes() for path, _, _ in paths]
+    books, invalid_files = read_catalog([*files, *uploads])
+    return books, invalid_files, build_search_index(books)
 
 
 def show_waypoint_photos(point):
@@ -400,6 +425,7 @@ def show_waypoint_photos(point):
     st.caption("등록된 사진이 없어요.")
 
 
+@st.fragment
 def show_map(name, feature_id, coordinates, waypoints):
     longitudes, latitudes = zip(*coordinates)
     view = pdk.ViewState(

@@ -314,36 +314,45 @@ def number_search_text(text):
     return NUMBER_WITH_COUNTER.sub(replace_counter, text)
 
 
-def search_books(books, query):
+def build_search_index(books):
+    return [
+        (book, normalized(book.title), normalized(book.author), normalized(number_search_text(book.title)))
+        for book in books
+    ]
+
+
+def search_books(books, query, index=None):
     key = normalized(query)
     if not key:
         return books, ""
-    indexed = [(book, normalized(book.title), normalized(book.author)) for book in books]
-    matches = [book for book, title, author in indexed if key in title or key in author]
+    index = build_search_index(books) if index is None else index
+    matches = [book for book, title, author, _ in index if key in title or key in author]
     if matches:
         return matches, ""
     number_query = NUMBER_WITH_COUNTER.search(unicodedata.normalize("NFKC", query))
     if number_query:
         query = number_search_text(query)
         key = normalized(query)
-        indexed = [(book, normalized(number_search_text(book.title)), author) for book, _, author in indexed]
-        matches = [book for book, title, _ in indexed if key in title]
+        matches = [book for book, _, _, numbered_title in index if key in numbered_title]
         if matches:
             return matches, "숫자 표기도 함께 검색했어요."
     terms = [term for token in query.split() if (term := normalized(token))]
     if len(terms) > 1:
-        matches = [book for book, title, author in indexed if all(term in title or term in author for term in terms)]
+        matches = [
+            book for book, title, author, numbered_title in index
+            if all(term in (numbered_title if number_query else title) or term in author for term in terms)
+        ]
         if matches:
             return matches, ""
     key = normalized(query)
     # Keep suggestions for longer titles separate from literal catalog matches.
     if len(key) >= 5 and not number_query:
-        titles = {title for _, title, _ in indexed if abs(len(title) - len(key)) <= 3}
+        titles = {title for _, title, _, _ in index if abs(len(title) - len(key)) <= 3}
         close = get_close_matches(key, sorted(titles), n=5, cutoff=0.82)
         if close:
             rank = {title: index for index, title in enumerate(close)}
-            suggestions = sorted((entry for entry in indexed if entry[1] in rank), key=lambda entry: rank[entry[1]])
-            return [book for book, _, _ in suggestions], "제목이 비슷한 책이에요. 찾던 책이 맞는지 확인해 주세요."
+            suggestions = sorted((entry for entry in index if entry[1] in rank), key=lambda entry: rank[entry[1]])
+            return [book for book, _, _, _ in suggestions], "제목이 비슷한 책이에요. 찾던 책이 맞는지 확인해 주세요."
     return [], ""
 
 
