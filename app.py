@@ -130,7 +130,10 @@ def automatic_book_mood(book, google_key, yes24_key):
         mood, terms, _ = infer_mood(Book(title="", description=note[0]))
         if mood:
             return mood, terms, [note[2]], note[1], note[2]
-    if not book.description and isbn and google_key:
+    mood, terms, sources = infer_mood(book)
+    if mood:
+        return mood, terms, sources, "", "지샘터 도서정보"
+    if isbn and google_key:
         cache_key = ("google", isbn)
         if cache_key not in cache:
             try:
@@ -144,8 +147,7 @@ def automatic_book_mood(book, google_key, yes24_key):
             mood, terms, sources = cache[cache_key]
             if mood:
                 return mood, terms, sources, "", "Google Books"
-    mood, terms, sources = infer_mood(book)
-    return mood, terms, sources, "", "지샘터 도서정보" if mood else ""
+    return None, [], [], "", ""
 
 
 def book_option_label(item):
@@ -211,34 +213,35 @@ def show_book_recommendation(folder, demo_books, routes):
             with button_column:
                 st.form_submit_button("검색")
         query = normalized(search_text)
-        matches, alternate = search_books(books, search_text)
-        if not matches:
-            st.info("검색 결과가 없어요. 제목이나 저자의 일부를 입력해 보세요.")
-            st.stop()
-        if alternate:
-            st.caption(f"숫자 표기도 함께 검색했어요 · {alternate}")
-
-        page_size = 40
-        total_pages = (len(matches) + page_size - 1) // page_size
-        page = 1
-        if total_pages > 1:
-            page = st.number_input("검색 결과 페이지", 1, total_pages, step=1, key=f"page-{query}")
-        start = (page - 1) * page_size
-        visible_books = matches[start:start + page_size]
-        choice_key = f"catalog_book_choice-{query}-{page}"
-        book = st.selectbox(
-            "검색 결과에서 책을 골라 주세요",
-            visible_books,
-            format_func=book_option_label,
-            accept_new_options=True,
-            help="목록에 없는 제목을 입력하고 Enter를 누르면 전체 장서를 검색해요.",
-            key=choice_key,
-        )
-        if isinstance(book, str):
-            st.session_state["pending_catalog_search"] = (book, choice_key)
-            st.rerun()
-        if book is None:
-            st.stop()
+        matches, search_message = search_books(books, search_text)
+        from_catalog = bool(matches)
+        if from_catalog:
+            if search_message:
+                st.caption(search_message)
+            page_size = 40
+            total_pages = (len(matches) + page_size - 1) // page_size
+            page = 1
+            if total_pages > 1:
+                page = st.number_input("검색 결과 페이지", 1, total_pages, step=1, key=f"page-{query}")
+            start = (page - 1) * page_size
+            visible_books = matches[start:start + page_size]
+            choice_key = f"catalog_book_choice-{query}-{page}"
+            book = st.selectbox(
+                "검색 결과에서 책을 골라 주세요",
+                visible_books,
+                format_func=book_option_label,
+                accept_new_options=True,
+                help="목록에 없는 제목을 입력하고 Enter를 누르면 전체 장서를 검색해요.",
+                key=choice_key,
+            )
+            if isinstance(book, str):
+                st.session_state["pending_catalog_search"] = (book, choice_key)
+                st.rerun()
+            if book is None:
+                st.stop()
+        else:
+            st.caption("장서에 일치하는 책이 없어 입력한 문구로 산책을 추천해요.")
+            book = Book(title=search_text.strip())
 
     with st.container(border=True, key="walk-design-book"):
         details = [f"<h2>{escape(book.title)}</h2>"]
@@ -313,6 +316,7 @@ def show_book_recommendation(folder, demo_books, routes):
                 st.session_state.pop("yes24_book_api_key", None)
                 st.session_state.pop("book_intro_recommendations", None)
                 st.rerun()
+        lookup_details = st.container()
     yes24_key = (
         st.session_state.get("yes24_book_api_key") or saved_yes24_key or server_yes24_key
     )
@@ -333,7 +337,12 @@ def show_book_recommendation(folder, demo_books, routes):
     evidence_url = evidence_name = ""
     suggested_mood, terms, sources = infer_mood(book, impression) if impression else (None, [], [])
     if selected_mood not in MOOD_ROUTES and not suggested_mood:
-        suggested_mood, terms, sources, evidence_url, evidence_name = automatic_book_mood(book, google_key, yes24_key)
+        if from_catalog:
+            with lookup_details:
+                suggested_mood, terms, sources, evidence_url, evidence_name = automatic_book_mood(book, google_key, yes24_key)
+        else:
+            suggested_mood, terms, _ = infer_mood(book)
+            sources = ["입력한 문구"] if suggested_mood else []
     if selected_mood in MOOD_ROUTES:
         feature_id = MOOD_ROUTES[selected_mood]
         reason = f"선택한 분위기 · {selected_mood}. {ROUTE_REASONS[feature_id]}"
@@ -343,7 +352,7 @@ def show_book_recommendation(folder, demo_books, routes):
         reason = f"{evidence}에서 찾은 단서 · {', '.join(terms)}. {ROUTE_REASONS[feature_id]}"
     else:
         feature_id = min(routes, key=lambda key: routes[key][1])
-        reason = "기본 코스 · 책 소개나 제목에서 분위기를 판단할 단서가 부족해 가장 짧은 코스를 제안해요."
+        reason = "가볍게 시작하는 산책 · 가장 짧은 코스를 제안해요. 원하는 분위기를 선택해 코스를 바꿀 수도 있어요."
 
     if evidence_url:
         st.markdown(f"추천에 참고한 자료 · [{evidence_name}]({evidence_url})")
