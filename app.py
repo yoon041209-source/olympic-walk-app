@@ -161,12 +161,13 @@ def semantic_model():
     return load_semantic_model()
 
 
-def recommend_by_sentence(documents, routes, source_links):
-    sentences = collect_sentences(documents)
+def recommend_by_sentence(documents, routes, source_links, *, metadata=False):
+    sentences = collect_sentences(documents, minimum_chars=4 if metadata else 6)
     if not sentences:
         return None
     if st.session_state.get("semantic_retry_at", 0) > monotonic():
-        st.caption("문장 모델을 불러오지 못해 키워드로 추천해요.")
+        if not metadata:
+            st.caption("문장 모델을 불러오지 못해 키워드와 장서 정보를 확인해요.")
         return None
 
     cache_key = (sentences, tuple(routes))
@@ -179,13 +180,15 @@ def recommend_by_sentence(documents, routes, source_links):
                 ranking = semantic_model().rank(sentences, routes)
         except SemanticUnavailable:
             st.session_state["semantic_retry_at"] = monotonic() + 60
-            st.caption("문장 모델을 불러오지 못해 키워드로 추천해요.")
+            st.caption("문장 모델을 불러오지 못해 키워드와 장서 정보를 확인해요.")
             return None
         st.session_state["semantic_ranking"] = (cache_key, ranking)
 
     winner = ranking[0]
-    if len(ranking) > 1 and winner.score - ranking[1].score < MIN_MARGIN:
-        st.caption("문장 점수가 비슷해 키워드도 비교해서 추천해요.")
+    margin = MIN_MARGIN * 1.5 if metadata else MIN_MARGIN
+    if len(ranking) > 1 and winner.score - ranking[1].score < margin:
+        if not metadata:
+            st.caption("문장 점수가 비슷해 키워드도 비교해서 추천해요.")
         return None
 
     with st.expander("코스별 문장 점수와 추천 근거"):
@@ -197,7 +200,8 @@ def recommend_by_sentence(documents, routes, source_links):
             st.text(sentence.text)
             if sentence.source in source_links:
                 st.markdown(f"[자료 보기]({source_links[sentence.source]})")
-    return winner.route, f"문장 의미 기준 · 상대 유사도 {winner.score:+.3f}. {ROUTE_REASONS[winner.route]}"
+    basis = "제목·주제 기반 참고 추천" if metadata else "문장 의미 기준"
+    return winner.route, f"{basis} · 상대 유사도 {winner.score:+.3f}. {ROUTE_REASONS[winner.route]}"
 
 
 def show_book_recommendation(folder, demo_books, routes):
@@ -416,11 +420,18 @@ def show_book_recommendation(folder, demo_books, routes):
         matches = match_route_keywords(documents, routes)
         used_metadata = not any(matches.values())
         if used_metadata:
-            matches = match_route_keywords([
+            metadata_documents = [
                 ("장서 제목" if from_catalog else "검색어", book.title),
-                ("장서 주제·주제어", " ".join((book.subject, book.keywords))),
-                ("장서 분류", book.category),
-            ], routes)
+                ("장서 주제", book.subject),
+                ("장서 주제어", book.keywords),
+            ]
+            matches = match_route_keywords([*metadata_documents, ("장서 분류", book.category)], routes)
+            if from_catalog and not any(matches.values()):
+                semantic = recommend_by_sentence(metadata_documents, routes, {}, metadata=True)
+                if semantic:
+                    feature_id, reason = semantic
+                    name, distance = routes[feature_id]
+                    return name, distance, feature_id, reason
 
         count = max(map(len, matches.values()))
         tied_routes = [route for route, hits in matches.items() if len(hits) == count]
@@ -446,7 +457,12 @@ def show_book_recommendation(folder, demo_books, routes):
                 for term, found_in in hits.items():
                     st.write(f"{term} · {', '.join(found_in)}")
         else:
-            reason = "일치하는 단어가 없어 가장 짧은 코스를 안내해요. 감상문이나 책 소개를 추가해 다시 추천받을 수 있어요."
+            has_text = bool(collect_sentences(documents))
+            detail = (
+                "현재 자료만으로는 특정 코스를 고르기 어려워요."
+                if has_text else "활용할 책 소개나 감상문이 없고, 제목·주제만으로는 고르기 어려워요."
+            )
+            reason = f"기본 코스 안내 · {detail} 가장 짧은 코스를 안내해요."
 
     name, distance = routes[feature_id]
     return name, distance, feature_id, reason

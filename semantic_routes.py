@@ -65,7 +65,7 @@ class RouteScore:
     evidence: tuple[Sentence, ...]
 
 
-def collect_sentences(documents):
+def collect_sentences(documents, minimum_chars=6):
     by_source = []
     seen = set()
     for source, text in documents:
@@ -73,7 +73,7 @@ def collect_sentences(documents):
         for piece in SENTENCE_BREAK.split(text):
             sentence = " ".join(piece.split())
             key = re.sub(r"[\W_]+", "", sentence).casefold()
-            if len(key) < 6 or key in seen:
+            if len(key) < minimum_chars or key in seen:
                 continue
             sentences.append(Sentence(source, sentence[:420]))
             seen.add(key)
