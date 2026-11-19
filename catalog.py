@@ -499,7 +499,7 @@ def yes24_response(search_type, query, api_key):
     if search_type != "ISBN13":
         params["searchType"] = search_type
     headers = {"X-Api-Key": api_key.strip()} if api_key else {}
-    with httpx.Client(timeout=httpx.Timeout(9, connect=6), follow_redirects=False) as client:
+    with httpx.Client(timeout=httpx.Timeout(9, connect=3), follow_redirects=False) as client:
         for attempt in range(2):
             try:
                 response = client.get(YES24_BOOK_URL, params=params, headers=headers)
@@ -517,7 +517,7 @@ def yes24_response(search_type, query, api_key):
                     if isinstance(cause, ssl.SSLError):
                         raise CatalogError("YES24와 보안 연결을 맺지 못했어요.") from None
                     cause = cause.__cause__
-                if attempt:
+                if isinstance(error, (httpx.ConnectTimeout, httpx.ConnectError)) or attempt:
                     raise CatalogError(messages[type(error)]) from None
             except httpx.HTTPError:
                 raise CatalogError("YES24에 요청을 보낼 수 없어요.") from None
