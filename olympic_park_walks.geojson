@@ -248,22 +248,38 @@
           {
             "order": 1,
             "name": "평화의광장",
-            "role": "start"
+            "role": "start",
+            "position": [
+              127.1168568,
+              37.5183172
+            ]
           },
           {
             "order": 2,
             "name": "곰말다리",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1176635,
+              37.5213245
+            ]
           },
           {
             "order": 3,
             "name": "소마미술관",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1183669,
+              37.5171746
+            ]
           },
           {
             "order": 4,
             "name": "평화의광장",
-            "role": "finish"
+            "role": "finish",
+            "position": [
+              127.1168568,
+              37.5183172
+            ]
           }
         ],
         "geometry_status": "aligned_to_map_screenshots",
@@ -722,6 +738,33 @@
             "order": 1,
             "name": "몽촌토성 순환로",
             "role": "route_description"
+          },
+          {
+            "order": 1,
+            "name": "몽촌토성 북쪽 산책로",
+            "role": "guide",
+            "position": [
+              127.1209043,
+              37.5238697
+            ]
+          },
+          {
+            "order": 2,
+            "name": "움집터전시관",
+            "role": "guide",
+            "position": [
+              127.1245765,
+              37.520551
+            ]
+          },
+          {
+            "order": 3,
+            "name": "야생화학습장",
+            "role": "guide",
+            "position": [
+              127.121468,
+              37.5184749
+            ]
           }
         ],
         "geometry_status": "aligned_to_map_screenshots",
@@ -1369,37 +1412,65 @@
           {
             "order": 1,
             "name": "곰말다리",
-            "role": "start"
+            "role": "start",
+            "position": [
+              127.1176635,
+              37.5213245
+            ]
           },
           {
             "order": 2,
             "name": "몽촌토성 중심",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1207693,
+              37.5212715
+            ]
           },
           {
             "order": 3,
             "name": "움집터전시관",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1245765,
+              37.520551
+            ]
           },
           {
             "order": 4,
             "name": "야생화학습장",
-            "role": "featured_stop"
+            "role": "featured_stop",
+            "position": [
+              127.121468,
+              37.5184749
+            ]
           },
           {
             "order": 5,
             "name": "몽촌토성 순환",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1197,
+              37.5180232
+            ]
           },
           {
             "order": 6,
             "name": "피크닉장",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1229624,
+              37.5240509
+            ]
           },
           {
             "order": 7,
             "name": "곰말다리",
-            "role": "finish"
+            "role": "finish",
+            "position": [
+              127.1176635,
+              37.5213245
+            ]
           }
         ],
         "source": {
@@ -2166,52 +2237,92 @@
           {
             "order": 1,
             "name": "곰말다리",
-            "role": "start"
+            "role": "start",
+            "position": [
+              127.1176635,
+              37.5213245
+            ]
           },
           {
             "order": 2,
             "name": "몽촌토성 중심",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1207693,
+              37.5212715
+            ]
           },
           {
             "order": 3,
             "name": "서울역사편찬원",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1247695,
+              37.5226441
+            ]
           },
           {
             "order": 4,
             "name": "88마당",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1250873,
+              37.5188009
+            ]
           },
           {
             "order": 5,
             "name": "삼거리매점",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1225402,
+              37.5204601
+            ]
           },
           {
             "order": 6,
             "name": "몽촌토성 중심",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1207693,
+              37.5212715
+            ]
           },
           {
             "order": 7,
             "name": "피크닉장",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1229624,
+              37.5240509
+            ]
           },
           {
             "order": 8,
             "name": "소마미술관",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1183669,
+              37.5171746
+            ]
           },
           {
             "order": 9,
             "name": "평화의광장",
-            "role": "via"
+            "role": "via",
+            "position": [
+              127.1168568,
+              37.5183172
+            ]
           },
           {
             "order": 10,
             "name": "곰말다리",
-            "role": "finish"
+            "role": "finish",
+            "position": [
+              127.1176635,
+              37.5213245
+            ]
           }
         ],
         "geometry_status": "aligned_to_map_screenshots",
@@ -2666,6 +2777,42 @@
             "order": 1,
             "name": "자전거 순환도로",
             "role": "route_description"
+          },
+          {
+            "order": 1,
+            "name": "곰말다리",
+            "role": "guide",
+            "position": [
+              127.1176635,
+              37.5213245
+            ]
+          },
+          {
+            "order": 2,
+            "name": "서울역사편찬원",
+            "role": "guide",
+            "position": [
+              127.1247695,
+              37.5226441
+            ]
+          },
+          {
+            "order": 3,
+            "name": "소마미술관",
+            "role": "guide",
+            "position": [
+              127.1183669,
+              37.5171746
+            ]
+          },
+          {
+            "order": 4,
+            "name": "평화의광장",
+            "role": "guide",
+            "position": [
+              127.1168568,
+              37.5183172
+            ]
           }
         ],
         "geometry_status": "aligned_to_map_screenshots",

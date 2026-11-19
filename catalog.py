@@ -20,6 +20,11 @@ CATALOG_DOWNLOAD_LOCK = Lock()
 
 # Short editorial notes keyed by the exact edition in the library catalog.
 EDITION_NOTES = {
+    "9788952784933": (
+        "할리우드 감독이 나무 집을 영화로 만들러 오고, 기발한 장치가 가득한 집에서 엉뚱한 소동이 벌어진다.",
+        "https://www.yes24.com/product/goods/35244690",
+        "YES24 책 소개 요약",
+    ),
     "9788943312381": (
         "개구리가 가시연잎을 배 삼아 연못에서 바다로 향하고, 거센 물결을 넘으며 낯선 세상을 만난다.",
         "https://www.yes24.com/product/goods/80921650",
@@ -451,16 +456,32 @@ def google_book_intro(isbn, api_key):
 
 
 def yes24_items(search_type, query, api_key):
-    try:
-        response = requests.get(
-            YES24_BOOK_URL,
-            params={"searchType": search_type, "query": query, "detail": "Y"},
-            headers={"X-Api-Key": api_key},
-            timeout=(3, 6),
-            allow_redirects=False,
-        )
-    except requests.RequestException:
-        raise CatalogError("YES24에 연결할 수 없어요.") from None
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                YES24_BOOK_URL,
+                params={"searchType": search_type, "query": query, "detail": "Y"},
+                headers={"X-Api-Key": api_key.strip()},
+                timeout=(4, 8),
+                allow_redirects=False,
+            )
+        except requests.exceptions.SSLError:
+            raise CatalogError("YES24와 보안 연결을 맺지 못했어요.") from None
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt:
+                raise CatalogError("YES24에 두 번 요청했지만 연결하지 못했어요.") from None
+        except requests.RequestException:
+            raise CatalogError("YES24에 요청을 보낼 수 없어요.") from None
+        else:
+            if response.status_code not in {500, 502, 503, 504} or attempt:
+                break
+        sleep(0.5)
+    if response.status_code == 401:
+        raise CatalogError("YES24가 API 키를 인증하지 못했어요 (HTTP 401).")
+    if response.status_code == 403:
+        raise CatalogError("YES24가 이 API 요청을 거부했어요 (HTTP 403).")
+    if response.status_code == 429:
+        raise CatalogError("YES24 API 요청 한도에 도달했어요 (HTTP 429).")
     if response.status_code == 404:
         return []
     if response.status_code != 200:

@@ -3,6 +3,7 @@ import os
 import sys
 from contextlib import closing
 from html import escape
+from math import cos, radians
 from pathlib import Path
 
 # QGIS에 포함된 Windows Python에서 SQLite DLL을 찾을 수 있게 합니다.
@@ -14,6 +15,7 @@ import sqlite3
 
 import pydeck as pdk
 import streamlit as st
+from PIL import Image, ImageDraw
 
 from catalog import Book, MOODS, MOOD_ROUTES, ROUTE_REASONS, infer_mood, normalized, official_book_url, read_catalog
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
@@ -92,6 +94,8 @@ def update_catalog(snapshot_path):
 def automatic_book_mood(book, google_key, yes24_key):
     isbn = book_isbn(book)
     cache = st.session_state.setdefault("book_intro_recommendations", {})
+    if yes24_key and not isbn:
+        st.caption("이 장서의 ISBN을 확인할 수 없어 YES24 상세 정보를 조회하지 못했어요.")
     if isbn and yes24_key:
         cache_key = ("yes24", isbn)
         if cache_key not in cache:
@@ -254,6 +258,12 @@ def show_book_recommendation(folder, demo_books, routes):
             details.append(f'<p><a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">지샘터 도서정보 보기</a></p>')
         korean_html("".join(details))
 
+    server_yes24_key = os.getenv("YES24_BOOK_API_KEY", "").strip()
+    if not server_yes24_key:
+        try:
+            server_yes24_key = str(st.secrets.get("YES24_BOOK_API_KEY", "")).strip()
+        except st.errors.StreamlitSecretNotFoundError:
+            pass
     with st.expander("책 소개 자동 조회 설정"):
         st.markdown(
             "YES24 키를 연결하면 책을 선택할 때 ISBN으로 줄거리와 책 소개를 찾아요. "
@@ -268,6 +278,8 @@ def show_book_recommendation(folder, demo_books, routes):
 
         if saved_yes24_key:
             st.caption("YES24 키가 이 Windows 계정에 저장되어 있어요.")
+        if server_yes24_key:
+            st.caption("서버에 YES24 키가 설정되어 있어요.")
         with st.form("book_intro_settings", clear_on_submit=True):
             yes24_key = st.text_input(
                 "YES24 API 키", type="password", placeholder="처음 연결하거나 키를 교체할 때 입력"
@@ -304,7 +316,7 @@ def show_book_recommendation(folder, demo_books, routes):
                 st.session_state.pop("book_intro_recommendations", None)
                 st.rerun()
     yes24_key = (
-        st.session_state.get("yes24_book_api_key") or saved_yes24_key or os.getenv("YES24_BOOK_API_KEY", "")
+        st.session_state.get("yes24_book_api_key") or saved_yes24_key or server_yes24_key
     )
     google_key = st.session_state.get(
         "google_books_api_key",
@@ -348,7 +360,61 @@ def cached_catalog(files):
     return read_catalog(files)
 
 
-def show_map(name, feature_id, coordinates, start_name):
+PARK_PHOTOS = {
+    "평화의광장": (
+        "peace-plaza.jpg",
+        "https://commons.wikimedia.org/wiki/File:Peace_Plaza_in_Seoul.jpg",
+        "Christophe95",
+        "CC BY-SA 4.0",
+        "https://creativecommons.org/licenses/by-sa/4.0/",
+    ),
+    "소마미술관": (
+        "soma-museum.jpg",
+        "https://commons.wikimedia.org/wiki/File:SOMA_museum.jpg",
+        "주전자",
+        "퍼블릭 도메인",
+        "https://commons.wikimedia.org/wiki/Template:PD-self",
+    ),
+}
+
+
+def show_waypoint_image(point, coordinates):
+    st.markdown(f"**{point['name']}**")
+    photo = PARK_PHOTOS.get(point["name"])
+    if photo:
+        filename, source, photographer, license_name, license_url = photo
+        path = Path(__file__).resolve().parent / "park_photos" / filename
+        if path.is_file():
+            st.image(str(path), width=480)
+            st.markdown(f"사진 · [{photographer} / Wikimedia Commons]({source}) · [{license_name}]({license_url})")
+            return
+
+    longitude, latitude = point["position"]
+    longitude_scale = cos(radians(latitude))
+    offsets = [((lon - longitude) * longitude_scale, lat - latitude) for lon, lat in coordinates]
+    # Include the selected point in the preview bounds even when it lies beside the trail.
+    east, north = zip(*offsets, (0, 0))
+    width, height, padding = 480, 240, 25
+    scale = min(
+        (width - 2 * padding) / max(max(east) - min(east), 1e-6),
+        (height - 2 * padding) / max(max(north) - min(north), 1e-6),
+    )
+    center_x = (min(east) + max(east)) / 2
+    center_y = (min(north) + max(north)) / 2
+    preview = Image.new("RGB", (width, height), "#e8f2ff")
+    draw = ImageDraw.Draw(preview)
+    draw.line(
+        [(width / 2 + (x - center_x) * scale, height / 2 - (y - center_y) * scale) for x, y in offsets],
+        fill="#126f4d",
+        width=4,
+        joint="curve",
+    )
+    x, y = width / 2 - center_x * scale, height / 2 + center_y * scale
+    draw.ellipse((x - 8, y - 8, x + 8, y + 8), fill="#135bb3", outline="white", width=2)
+    st.image(preview, caption="코스 내 위치 안내 이미지", width=480)
+
+
+def show_map(name, feature_id, coordinates, waypoints):
     longitudes, latitudes = zip(*coordinates)
     view = pdk.ViewState(
         longitude=(min(longitudes) + max(longitudes)) / 2,
@@ -366,24 +432,53 @@ def show_map(name, feature_id, coordinates, start_name):
         width_max_pixels=7,
         cap_rounded=True,
         joint_rounded=True,
-        pickable=True,
     )
     layers = [route_layer]
-    if start_name:
-        layers.append(
+    points = {}
+    for waypoint in waypoints:
+        position = waypoint.get("position")
+        if position is None and waypoint["role"] == "start":
+            position = coordinates[0]
+        if position is not None:
+            # A place visited more than once shares one marker.
+            points.setdefault(waypoint["name"], {
+                "name": waypoint["name"],
+                "position": position,
+                "label": str(waypoint["order"]),
+                "color": [191, 64, 35] if waypoint["role"] == "start" else [19, 91, 179],
+            })
+    marker_layer_id = f"{feature_id}-waypoints"
+    if points:
+        st.caption("주황색은 출발점이에요. 번호가 있는 지점을 누르면 지도 아래에 이미지가 나타나요.")
+        layers.extend([
             pdk.Layer(
                 "ScatterplotLayer",
-                id=f"{feature_id}-start",
-                data=[{"name": start_name, "position": coordinates[0]}],
+                id=marker_layer_id,
+                data=list(points.values()),
                 get_position="position",
-                get_fill_color=[230, 88, 45],
-                get_radius=8,
-                radius_min_pixels=8,
+                get_fill_color="color",
+                radius_units=pdk.types.String("pixels"),
+                get_radius=12,
+                stroked=True,
+                get_line_color=[255, 255, 255],
+                line_width_min_pixels=2,
                 pickable=True,
-            )
-        )
+            ),
+            pdk.Layer(
+                "TextLayer",
+                id=f"{feature_id}-waypoint-labels",
+                data=list(points.values()),
+                get_position="position",
+                get_text="label",
+                get_size=12,
+                get_color=[255, 255, 255],
+                font_weight=700,
+                get_text_anchor=pdk.types.String("middle"),
+                get_alignment_baseline=pdk.types.String("center"),
+            ),
+        ])
 
-    st.pydeck_chart(
+    event = st.pydeck_chart(
         pdk.Deck(
             layers=layers,
             initial_view_state=view,
@@ -392,7 +487,12 @@ def show_map(name, feature_id, coordinates, start_name):
         ),
         height=460,
         key=f"map-{feature_id}",
+        on_select="rerun",
+        selection_mode="single-object",
     )
+    selected = event.selection.objects.get(marker_layer_id, [])
+    if selected and (point := points.get(selected[0].get("name"))):
+        show_waypoint_image(point, coordinates)
 
 
 st.set_page_config(page_title=TITLE)
@@ -459,7 +559,7 @@ waypoints = sorted(
     key=lambda point: point["order"],
 )
 start_name = next((point["name"] for point in waypoints if point["role"] == "start"), None)
-stops = [point for point in waypoints if point["role"] != "route_description"]
+stops = [point for point in waypoints if point["role"] in {"start", "via", "featured_stop", "finish"}]
 description = next(
     (point["name"] for point in waypoints if point["role"] == "route_description"),
     None,
@@ -477,8 +577,8 @@ with st.container(border=True, key="walk-design-result"):
     korean_html("".join(summary))
 
 with st.container(border=True, key="walk-design-map"):
-    show_map(name, feature_id, coordinates, start_name)
-    korean_html("<small>산책로와 출발점은 안내용 근사 위치입니다.</small>")
+    show_map(name, feature_id, coordinates, waypoints)
+    korean_html("<small>산책로와 지점 표시는 안내용 근사 위치입니다.</small>")
 
     if stops:
         stop_names = [
