@@ -1,14 +1,9 @@
 import json
 import os
-import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from html import escape
-from html.parser import HTMLParser
 from pathlib import Path
-from time import monotonic
-from urllib.parse import urlencode
 
 # QGIS에 포함된 Windows Python에서 SQLite DLL을 찾을 수 있게 합니다.
 qgis_folder = Path(sys.base_prefix).parent.parent
@@ -20,12 +15,11 @@ import sqlite3
 import pydeck as pdk
 import streamlit as st
 
-from catalog import Book, MOOD_ROUTES, ROUTE_REASONS, match_route_keywords, normalized, official_book_url, read_catalog
+from catalog import Book, MOODS, MOOD_ROUTES, ROUTE_REASONS, infer_mood, normalized, official_book_url, read_catalog
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
-from catalog import EDITION_NOTES, book_isbn, google_book_intro
-from catalog import number_search_text, plain_text
-from catalog import build_search_index, search_books
-from semantic_routes import MIN_MARGIN, SemanticUnavailable, collect_sentences, load_semantic_model
+from catalog import EDITION_NOTES, book_isbn, google_book_intro, yes24_book_text
+from catalog import load_yes24_key, save_yes24_key, yes24_key_path
+from catalog import search_books
 
 
 TITLE = "책 한 권으로 시작하는 올림픽공원 산책"
@@ -95,218 +89,67 @@ def update_catalog(snapshot_path):
             CATALOG_DOWNLOAD_LOCK.release()
 
 
-YES24_SITE = "https://www.yes24.com"
-
-
-def yes24_search_url(query):
-    return f"{YES24_SITE}/Product/Search?{urlencode({'domain': 'ALL', 'query': query})}"
-
-
-def yes24_title_query(book):
-    author = book.author.split(" 외", 1)[0].strip()
-    return " ".join((number_search_text(book.title), author)).strip()
-
-
-class Yes24Page(HTMLParser):
-    SECTION_NAMES = {
-        "infoset_introduce": "책 소개",
-        "infoset_pubreivew": "출판사 리뷰",
-        "infoset_pubreview": "출판사 리뷰",
-    }
-
-    def __init__(self, html):
-        super().__init__(convert_charrefs=True)
-        self.matches = {}
-        self.sections = {}
-        self.product_title = ""
-        self.product_author = ""
-        self.depth = 0
-        self.section = None
-        self.capture = None
-        self.feed(html)
-        self.close()
-
-    def handle_starttag(self, tag, attributes):
-        attrs = dict(attributes)
-        classes = (attrs.get("class") or "").split()
-        if tag == "div":
-            self.depth += 1
-            section_name = self.SECTION_NAMES.get((attrs.get("id") or "").lower())
-            if section_name:
-                self.section = self.depth, section_name
-        if tag == "meta" and attrs.get("property") == "og:title":
-            parts = (attrs.get("content") or "").split(" | ")
-            if len(parts) >= 3:
-                self.product_title, self.product_author = parts[:2]
-        if tag == "a" and "gd_name" in classes:
-            match = re.fullmatch(r"(?:https://www\.yes24\.com)?/product/goods/(\d+)(?:\?[^#]*)?", attrs.get("href") or "", re.I)
-            if match:
-                self.capture = tag, match[1], []
-        if self.section and tag == "textarea" and "txtContentText" in classes:
-            self.capture = tag, self.section[1], []
-
-    def handle_data(self, text):
-        if self.capture:
-            self.capture[2].append(text)
-
-    def handle_endtag(self, tag):
-        if self.capture and self.capture[0] == tag:
-            _, key, parts = self.capture
-            self.capture = None
-            text = plain_text("".join(parts))
-            if text and tag == "textarea":
-                self.sections.setdefault(key, text[:6000])
-            elif text:
-                self.matches.setdefault(key, text)
-        if tag == "div":
-            if self.section and self.section[0] == self.depth:
-                self.section = None
-            self.depth -= 1
-
-
-def yes24_page_html(client, url, stage):
-    import httpx
-
-    try:
-        response = client.get(url)
-    except httpx.ConnectTimeout:
-        raise CatalogError(f"YES24 {stage}에 연결하는 시간이 초과됐어요.") from None
-    except httpx.ReadTimeout:
-        raise CatalogError(f"YES24 {stage}의 응답을 기다리다 시간이 초과됐어요.") from None
-    except httpx.RequestError:
-        raise CatalogError(f"YES24 {stage}에 요청을 보내지 못했어요.") from None
-    if response.status_code != 200:
-        raise CatalogError(f"YES24 {stage}에서 HTTP {response.status_code}를 반환했어요.")
-    return response.text
-
-
-def yes24_web_book_text(book):
-    import httpx
-
+def automatic_book_mood(book, google_key, yes24_key, lookup_status):
     isbn = book_isbn(book)
-    title = normalized(number_search_text(book.title))
-    author_words = set(re.findall(r"[^\W_]+", book.author.split(" 외", 1)[0].casefold()))
-    queries = ([isbn] if isbn else []) + [yes24_title_query(book)]
-    seen = set()
-    with httpx.Client(timeout=httpx.Timeout(10, connect=60), follow_redirects=False) as client:
-        for query in dict.fromkeys(filter(None, queries)):
-            search = Yes24Page(yes24_page_html(client, yes24_search_url(query), "검색 페이지"))
-            if query == isbn:
-                candidates = list(search.matches)
+    cache = st.session_state.setdefault("book_intro_recommendations", {})
+    if not yes24_key:
+        lookup_status.caption("YES24 API 미조회 · API 키가 설정되지 않았어요.")
+    elif not isbn:
+        lookup_status.caption("YES24 API 미조회 · 장서 정보에서 유효한 ISBN을 확인할 수 없어요.")
+    else:
+        cache_key = ("yes24-detail", isbn)
+        if cache_key not in cache:
+            try:
+                with st.spinner("YES24에서 같은 ISBN의 책을 찾고 있어요."):
+                    sections, link, matched = yes24_book_text(isbn, yes24_key)
+            except CatalogError as error:
+                lookup_status.caption(f"YES24 API 조회 오류 · {error}")
             else:
-                candidates = [item for item, name in search.matches.items() if normalized(number_search_text(name)) == title]
-            candidates = [item for item in candidates if item not in seen][:2]
-            for item in candidates:
-                seen.add(item)
-                link = f"{YES24_SITE}/product/goods/{item}"
-                html = yes24_page_html(client, link, "상품 상세 페이지")
-                page = Yes24Page(html)
-                match = re.search(r">\s*ISBN13\s*</th>\s*<td\b[^>]*>\s*(97[89]\d{10})\s*</td>", html, re.I)
-                if isbn and match:
-                    same_book = match[1] == isbn
-                else:
-                    author = set(re.findall(r"[^\W_]+", page.product_author.casefold()))
-                    same_book = (
-                        bool(author_words)
-                        and author_words <= author
-                        and normalized(number_search_text(page.product_title)) == title
-                    )
-                if same_book:
-                    return list(page.sections.items()), link
-    return [], ""
-
-
-@st.cache_resource(show_spinner=False)
-def book_lookup_executor():
-    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="book-lookup")
-
-
-def fetch_book_documents(book, google_key):
-    sections, link = [], ""
-    yes24_error = google_error = description = ""
-    try:
-        sections, link = yes24_web_book_text(book)
-    except CatalogError as error:
-        yes24_error = str(error)
-    isbn = book_isbn(book)
-    if google_key and isbn and not sections:
-        try:
-            description = google_book_intro(isbn, google_key)
-        except CatalogError as error:
-            google_error = str(error)
-    return sections, link, yes24_error, description, google_error
-
-
-def cancel_book_lookup():
-    pending = st.session_state.pop("pending_book_lookup", None)
-    if pending:
-        pending[1].cancel()
-
-
-@st.fragment(run_every=0.75)
-def refresh_when_books_arrive(future):
-    if future.done():
-        st.rerun()
-
-
-def collect_book_documents(book, google_key, lookup_status, external_lookup):
-    isbn = book_isbn(book)
-    documents = [("지샘터 책 소개", book.description)]
-    source_links = {}
+                recommendation = None
+                for label, value in sections:
+                    mood, terms, _ = infer_mood(Book(title="", description=value))
+                    if mood:
+                        recommendation = (mood, terms, [label], link, "YES24 도서 정보")
+                        break
+                cache[cache_key] = (recommendation, link, matched, bool(sections))
+        if cache_key in cache:
+            recommendation, link, matched, has_text = cache[cache_key]
+            if recommendation:
+                lookup_status.caption("YES24 API 조회 성공 · 받은 내용을 추천에 사용했어요.")
+                return recommendation
+            if matched:
+                message = (
+                    "소개 자료를 받았지만 추천 기준에 맞는 단서가 없어요."
+                    if has_text else "같은 ISBN의 책을 찾았지만 소개 자료가 비어 있어요."
+                )
+                lookup_status.caption(f"YES24 API 조회 성공 · {message}")
+                if link and isbn not in EDITION_NOTES:
+                    st.markdown(f"[YES24 상품 페이지 보기]({link})")
+            else:
+                lookup_status.caption("YES24 API 응답 수신 · 같은 ISBN의 도서가 반환되지 않았어요.")
     note = EDITION_NOTES.get(isbn)
     if note:
-        text, link, source = note
-        documents.append((source, text))
-        source_links[source] = link
-    if not external_lookup:
-        cancel_book_lookup()
-        lookup_status.caption("외부 책 소개 조회를 끈 상태예요.")
-        return documents, source_links
-
-    cache = st.session_state.setdefault("book_intro_recommendations", {})
-    cache_key = (isbn, book.title, book.author)
-    expires_at, result = cache.get(cache_key, (0, None))
-    pending = st.session_state.get("pending_book_lookup")
-    if pending and pending[0] != cache_key:
-        cancel_book_lookup()
-        pending = None
-
-    if expires_at <= monotonic():
-        if pending is None:
-            future = book_lookup_executor().submit(fetch_book_documents, book, google_key)
-            st.session_state["pending_book_lookup"] = (cache_key, future)
-        else:
-            future = pending[1]
-        if not future.done():
-            lookup_status.caption("외부 책 소개를 확인 중이에요. 먼저 현재 자료로 추천을 보여드려요.")
-            refresh_when_books_arrive(future)
-            return documents, source_links
-        st.session_state.pop("pending_book_lookup", None)
-        try:
-            result = future.result()
-        except Exception:
-            error_message = "외부 서비스 응답을 처리하지 못했어요."
-            result = [], "", error_message, "", ""
-        ttl = 30 if result[2] or result[4] else 3600
-        cache[cache_key] = (monotonic() + ttl, result)
-
-    sections, link, yes24_error, description, google_error = result
-    for label, text in sections:
-        source = f"YES24 웹 {label}"
-        documents.append((source, text))
-        source_links[source] = link
-    if sections:
-        lookup_status.markdown(f"YES24 웹 자료 {len(sections)}종을 추천에 반영했어요. [상품 페이지 보기]({link})")
-    elif link:
-        lookup_status.markdown(f"YES24에서 책을 찾았어요. [상품 페이지에서 소개 확인하기]({link})")
-    else:
-        lookup_status.caption(yes24_error or "YES24 웹 검색에서 같은 책을 확인하지 못했어요.")
-    if description:
-        documents.append(("Google Books 책 소개", description))
-        st.caption("Google Books에서 책 소개를 받았어요.")
-    elif google_error:
-        st.caption(google_error)
-    return documents, source_links
+        mood, terms, _ = infer_mood(Book(title="", description=note[0]))
+        if mood:
+            return mood, terms, [note[2]], note[1], note[2]
+    mood, terms, sources = infer_mood(book)
+    if mood:
+        return mood, terms, sources, "", "지샘터 도서정보"
+    if isbn and google_key:
+        cache_key = ("google", isbn)
+        if cache_key not in cache:
+            try:
+                with st.spinner("같은 ISBN의 책 소개를 찾고 있어요."):
+                    description = google_book_intro(isbn, google_key)
+            except CatalogError as error:
+                st.caption(str(error))
+            else:
+                cache[cache_key] = infer_mood(Book(title="", description=description))
+        if cache_key in cache:
+            mood, terms, sources = cache[cache_key]
+            if mood:
+                return mood, terms, sources, "", "Google Books"
+    return None, [], [], "", ""
 
 
 def book_option_label(item):
@@ -315,59 +158,17 @@ def book_option_label(item):
     return " · ".join(part for part in (item.title, item.author, item.publisher, item.isbn) if part)
 
 
-@st.cache_resource(show_spinner=False)
-def semantic_model():
-    return load_semantic_model()
-
-
-def recommend_by_sentence(documents, routes, source_links, *, metadata=False):
-    sentences = collect_sentences(documents, minimum_chars=4 if metadata else 6)
-    if not sentences:
-        return None
-    if st.session_state.get("semantic_retry_at", 0) > monotonic():
-        if not metadata:
-            st.caption("문장 모델을 불러오지 못해 키워드와 장서 정보를 확인해요.")
-        return None
-
-    cache_key = (sentences, tuple(routes))
-    previous = st.session_state.get("semantic_ranking")
-    if previous and previous[0] == cache_key:
-        ranking = previous[1]
-    else:
-        try:
-            with st.spinner("책의 문장과 산책 코스의 분위기를 비교하고 있어요."):
-                ranking = semantic_model().rank(sentences, routes)
-        except SemanticUnavailable:
-            st.session_state["semantic_retry_at"] = monotonic() + 60
-            st.caption("문장 모델을 불러오지 못해 키워드와 장서 정보를 확인해요.")
-            return None
-        st.session_state["semantic_ranking"] = (cache_key, ranking)
-
-    winner = ranking[0]
-    margin = MIN_MARGIN * 1.5 if metadata else MIN_MARGIN
-    if len(ranking) > 1 and winner.score - ranking[1].score < margin:
-        if not metadata:
-            st.caption("문장 점수가 비슷해 키워드도 비교해서 추천해요.")
-        return None
-
-    with st.expander("코스별 문장 점수와 추천 근거"):
-        st.caption("문장마다 다섯 코스의 평균을 기준으로 계산한 상대 유사도예요.")
-        for result in ranking:
-            st.write(f"{routes[result.route][0]} · {result.score:+.3f}")
-        for sentence in winner.evidence:
-            st.caption(sentence.source)
-            if not sentence.source.startswith("YES24 웹 "):
-                st.text(sentence.text)
-            if sentence.source in source_links:
-                st.markdown(f"[자료 보기]({source_links[sentence.source]})")
-    basis = "제목·주제 기반 참고 추천" if metadata else "문장 의미 기준"
-    return winner.route, f"{basis} · 상대 유사도 {winner.score:+.3f}. {ROUTE_REASONS[winner.route]}"
-
-
 def show_book_recommendation(folder, demo_books, routes):
     xml_folder = folder / "catalog"
     snapshot = xml_folder / "ksponco-api.xml"
     update_catalog(snapshot)
+    paths = sorted(path for path in xml_folder.glob("*.xml") if path.is_file())
+    try:
+        files = [path.read_bytes() for path in paths]
+    except OSError:
+        st.error("catalog 폴더의 XML 파일을 읽을 수 없어요.")
+        files = []
+
     with st.expander("공공데이터 XML 가져오기"):
         st.markdown(
             "올림픽공원 도서정보 API의 응답 여러 페이지를 XML 파일로 올리거나 "
@@ -375,24 +176,14 @@ def show_book_recommendation(folder, demo_books, routes):
         )
         st.markdown(f"[공공데이터포털 · 도서정보 15008517]({DATASET_URL})")
         uploads = st.file_uploader("도서 목록 XML", type="xml", accept_multiple_files=True)
-    files = tuple(upload.getvalue() for upload in uploads)
+    files += [upload.getvalue() for upload in uploads]
     preview = st.session_state.get("catalog_api_preview")
     if preview is not None:
         if st.button("테스트 목록 닫기"):
             st.session_state.pop("catalog_api_preview")
             st.rerun()
-        books, invalid_files, search_index = cached_catalog((), (preview,))
-    else:
-        try:
-            paths = []
-            for path in sorted(xml_folder.glob("*.xml")):
-                if path.is_file():
-                    info = path.stat()
-                    paths.append((str(path), info.st_mtime_ns, info.st_size))
-            books, invalid_files, search_index = cached_catalog(tuple(paths), files)
-        except OSError:
-            st.error("catalog 폴더의 XML 파일을 읽을 수 없어요.")
-            books, invalid_files, search_index = cached_catalog((), files)
+        files = [preview]
+    books, invalid_files = cached_catalog(tuple(files))
 
     if invalid_files:
         st.warning(
@@ -403,7 +194,6 @@ def show_book_recommendation(folder, demo_books, routes):
     source_is_xml = bool(books)
     if not source_is_xml:
         books = demo_books
-        search_index = build_search_index(books)
         st.info("현재는 기존 10권으로 체험 중이에요. 전체 검색은 API 응답 XML을 불러온 범위에서 제공돼요.")
     else:
         st.caption(f"불러온 도서 {len(books):,}권 · 출처: 올림픽공원 도서정보 API (15008517)")
@@ -425,12 +215,7 @@ def show_book_recommendation(folder, demo_books, routes):
             with button_column:
                 st.form_submit_button("검색")
         query = normalized(search_text)
-        previous = st.session_state.get("last_catalog_search")
-        if previous and previous[0] is books and previous[1] == search_text:
-            matches, search_message = previous[2]
-        else:
-            matches, search_message = search_books(books, search_text, search_index)
-            st.session_state["last_catalog_search"] = (books, search_text, (matches, search_message))
+        matches, search_message = search_books(books, search_text)
         from_catalog = bool(matches)
         if from_catalog:
             if search_message:
@@ -476,114 +261,115 @@ def show_book_recommendation(folder, demo_books, routes):
             details.append(f'<p><a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">지샘터 도서정보 보기</a></p>')
         korean_html("".join(details))
 
-    if from_catalog:
-        search_query = book_isbn(book) or yes24_title_query(book)
-        st.link_button("YES24에서 직접 검색", yes24_search_url(search_query))
-
+    server_yes24_key = os.getenv("YES24_BOOK_API_KEY", "").strip()
+    if not server_yes24_key:
+        try:
+            server_yes24_key = str(st.secrets.get("YES24_BOOK_API_KEY", "")).strip()
+        except st.errors.StreamlitSecretNotFoundError:
+            pass
     with st.expander("책 소개 자동 조회 설정"):
-        st.caption("YES24 웹사이트에서 ISBN으로 먼저 찾고, 확인되지 않으면 제목과 저자로 검색해요.")
-        external_lookup = st.toggle("외부 책 소개 자동 조회", value=True)
+        st.markdown(
+            "YES24 키를 연결하면 책을 선택할 때 ISBN으로 줄거리와 책 소개를 찾아요. "
+            "[YES24 Developers](https://developers.yes24.com/)"
+        )
+        key_path = yes24_key_path()
+        saved_yes24_key = ""
+        try:
+            saved_yes24_key = load_yes24_key(key_path)
+        except (OSError, UnicodeError):
+            st.warning("저장된 YES24 키를 읽지 못했어요. 키를 다시 입력하면 교체할 수 있어요.")
+
+        if saved_yes24_key:
+            st.caption("YES24 키가 이 Windows 계정에 저장되어 있어요.")
+        if server_yes24_key:
+            st.caption("서버에 YES24 키가 설정되어 있어요.")
         with st.form("book_intro_settings", clear_on_submit=True):
-            google_key = st.text_input("Google Books API 키 (선택)", type="password")
+            yes24_key = st.text_input(
+                "YES24 API 키", type="password", placeholder="처음 연결하거나 키를 교체할 때 입력"
+            )
+            google_key = st.text_input(
+                "Google Books API 키 (선택)", type="password", value=os.getenv("GOOGLE_BOOKS_API_KEY", "")
+            )
             apply_settings = st.form_submit_button("책 소개 검색 연결")
         if apply_settings:
+            new_key = yes24_key.strip()
+            if new_key:
+                if key_path is None:
+                    st.session_state["yes24_book_api_key"] = new_key
+                    st.caption("이번 세션에 YES24 키를 적용했어요.")
+                else:
+                    try:
+                        save_yes24_key(key_path, new_key)
+                    except OSError:
+                        st.session_state["yes24_book_api_key"] = new_key
+                        st.warning("YES24 키를 저장하지 못했어요. 이번 세션에는 적용했어요.")
+                    else:
+                        st.session_state.pop("yes24_book_api_key", None)
+                        saved_yes24_key = new_key
+                        st.success("YES24 키를 저장했어요. 앱을 다시 실행해도 자동으로 연결해요.")
             st.session_state["google_books_api_key"] = google_key.strip()
             st.session_state.pop("book_intro_recommendations", None)
-            cancel_book_lookup()
-    google_key = st.session_state.get("google_books_api_key") or os.getenv("GOOGLE_BOOKS_API_KEY", "")
+        if key_path is not None and key_path.is_file() and st.button("저장한 YES24 키 삭제"):
+            try:
+                key_path.unlink(missing_ok=True)
+            except OSError:
+                st.warning("저장된 YES24 키를 삭제하지 못했어요.")
+            else:
+                st.session_state.pop("yes24_book_api_key", None)
+                st.session_state.pop("book_intro_recommendations", None)
+                st.rerun()
+        lookup_details = st.container()
+    yes24_key = (
+        st.session_state.get("yes24_book_api_key") or saved_yes24_key or server_yes24_key
+    )
+    google_key = st.session_state.get(
+        "google_books_api_key",
+        os.getenv("GOOGLE_BOOKS_API_KEY", ""),
+    )
 
     with st.expander("내 감상이나 선호 반영하기"):
-        book_key = (book.title, book.author, book.publisher, book.publication_year)
-        impression = st.text_area(
-            "내 감상문 (선택)",
+        impression = st.text_input(
+            "책에서 기억에 남은 장면이나 느낌 (선택)",
             placeholder="예: 바다를 바라보는 고요한 장면",
-            key=f"impression-{book_key}",
+            key=f"impression-{book.title}-{book.author}-{book.publisher}-{book.publication_year}",
         ).strip()
-        extra_text = st.text_area(
-            "추가 자료 (선택)",
-            placeholder="책 소개, 줄거리, 출판사 리뷰 등을 붙여 넣으세요.",
-            key=f"book-evidence-{book_key}",
-        ).strip()
-        available_moods = [mood for mood, route in MOOD_ROUTES.items() if route in routes]
+        available_moods = [mood for mood in MOODS if MOOD_ROUTES[mood] in routes]
         selected_mood = st.selectbox("산책 분위기", ["책 정보에서 자동 추천", *available_moods])
 
+    evidence_url = evidence_name = ""
+    lookup_status = st.empty()
+    suggested_mood, terms, sources = infer_mood(book, impression) if impression else (None, [], [])
+    if selected_mood not in MOOD_ROUTES and not suggested_mood:
+        if from_catalog:
+            with lookup_details:
+                suggested_mood, terms, sources, evidence_url, evidence_name = automatic_book_mood(
+                    book, google_key, yes24_key, lookup_status
+                )
+        else:
+            suggested_mood, terms, _ = infer_mood(book)
+            sources = ["입력한 문구"] if suggested_mood else []
     if selected_mood in MOOD_ROUTES:
-        cancel_book_lookup()
         feature_id = MOOD_ROUTES[selected_mood]
         reason = f"선택한 분위기 · {selected_mood}. {ROUTE_REASONS[feature_id]}"
+    elif suggested_mood and MOOD_ROUTES[suggested_mood] in routes:
+        feature_id = MOOD_ROUTES[suggested_mood]
+        evidence = "·".join(sources)
+        reason = f"{evidence}에서 찾은 단서 · {', '.join(terms)}. {ROUTE_REASONS[feature_id]}"
     else:
-        documents = [("독자 감상문", impression), ("직접 입력한 자료", extra_text)]
-        source_links = {}
-        if from_catalog:
-            lookup_status = st.empty()
-            book_documents, source_links = collect_book_documents(
-                book, google_key, lookup_status, external_lookup
-            )
-            documents.extend(book_documents)
-        else:
-            cancel_book_lookup()
-        semantic = recommend_by_sentence(documents, routes, source_links)
-        if semantic:
-            feature_id, reason = semantic
-            name, distance = routes[feature_id]
-            return name, distance, feature_id, reason
+        feature_id = min(routes, key=lambda key: routes[key][1])
+        reason = "가볍게 시작하는 산책 · 가장 짧은 코스를 제안해요. 원하는 분위기를 선택해 코스를 바꿀 수도 있어요."
 
-        matches = match_route_keywords(documents, routes)
-        used_metadata = not any(matches.values())
-        if used_metadata:
-            metadata_documents = [
-                ("장서 제목" if from_catalog else "검색어", book.title),
-                ("장서 주제", book.subject),
-                ("장서 주제어", book.keywords),
-            ]
-            matches = match_route_keywords([*metadata_documents, ("장서 분류", book.category)], routes)
-            if from_catalog and not any(matches.values()):
-                semantic = recommend_by_sentence(metadata_documents, routes, {}, metadata=True)
-                if semantic:
-                    feature_id, reason = semantic
-                    name, distance = routes[feature_id]
-                    return name, distance, feature_id, reason
-
-        count = max(map(len, matches.values()))
-        tied_routes = [route for route, hits in matches.items() if len(hits) == count]
-        feature_id = min(tied_routes, key=lambda route: routes[route][1])
-        if count:
-            hits = matches[feature_id]
-            words = ", ".join(list(hits)[:8])
-            if count > 8:
-                words += f" 외 {count - 8}개"
-            basis = "제목·주제 정보" if used_metadata else "책 자료·감상문"
-            reason = f"{basis} 기준 · 일치 단어 {count}개 ({words}). {ROUTE_REASONS[feature_id]}"
-            if len(tied_routes) > 1:
-                reason += " 동점인 코스 중 가장 짧은 길을 골랐어요."
-            sources = list(dict.fromkeys(source for found_in in hits.values() for source in found_in))
-            for source in sources:
-                if source in source_links:
-                    st.markdown(f"추천에 사용한 자료 · [{source}]({source_links[source]})")
-            with st.expander("코스별 일치 단어와 추천 근거"):
-                for route, route_hits in matches.items():
-                    words = ", ".join(route_hits)
-                    st.write(f"{routes[route][0]} · {len(route_hits)}개" + (f" · {words}" if words else ""))
-                st.caption("선택된 코스의 단어별 출처")
-                for term, found_in in hits.items():
-                    st.write(f"{term} · {', '.join(found_in)}")
-        else:
-            has_text = bool(collect_sentences(documents))
-            detail = (
-                "현재 자료만으로는 특정 코스를 고르기 어려워요."
-                if has_text else "활용할 책 소개나 감상문이 없고, 제목·주제만으로는 고르기 어려워요."
-            )
-            reason = f"기본 코스 안내 · {detail} 가장 짧은 코스를 안내해요."
-
+    if evidence_url:
+        st.markdown(f"추천에 참고한 자료 · [{evidence_name}]({evidence_url})")
+    elif evidence_name:
+        st.caption(f"추천에 참고한 자료 · {evidence_name}")
     name, distance = routes[feature_id]
     return name, distance, feature_id, reason
 
 
-@st.cache_resource(show_spinner=False, max_entries=4)
-def cached_catalog(paths, uploads):
-    files = [Path(path).read_bytes() for path, _, _ in paths]
-    books, invalid_files = read_catalog([*files, *uploads])
-    return books, invalid_files, build_search_index(books)
+@st.cache_data(show_spinner=False)
+def cached_catalog(files):
+    return read_catalog(files)
 
 
 def show_waypoint_photos(point):
@@ -603,7 +389,6 @@ def show_waypoint_photos(point):
     st.caption("등록된 사진이 없어요.")
 
 
-@st.fragment
 def show_map(name, feature_id, coordinates, waypoints):
     longitudes, latitudes = zip(*coordinates)
     view = pdk.ViewState(
