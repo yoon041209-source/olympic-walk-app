@@ -188,7 +188,7 @@ def yes24_web_book_text(book):
     author_words = set(re.findall(r"[^\W_]+", book.author.split(" 외", 1)[0].casefold()))
     queries = ([isbn] if isbn else []) + [yes24_title_query(book)]
     seen = set()
-    with httpx.Client(timeout=httpx.Timeout(10, connect=3), follow_redirects=False) as client:
+    with httpx.Client(timeout=httpx.Timeout(10, connect=60), follow_redirects=False) as client:
         for query in dict.fromkeys(filter(None, queries)):
             search = Yes24Page(yes24_page_html(client, yes24_search_url(query), "검색 페이지"))
             if query == isbn:
