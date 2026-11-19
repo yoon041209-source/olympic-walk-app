@@ -15,7 +15,7 @@ import sqlite3
 import pydeck as pdk
 import streamlit as st
 
-from catalog import Book, MOODS, MOOD_ROUTES, ROUTE_REASONS, infer_mood, normalized, official_book_url, read_catalog
+from catalog import Book, MOOD_ROUTES, ROUTE_REASONS, match_route_keywords, normalized, official_book_url, read_catalog
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
 from catalog import EDITION_NOTES, book_isbn, google_book_intro, yes24_book_text
 from catalog import load_yes24_key, save_yes24_key, yes24_key_path
@@ -89,65 +89,53 @@ def update_catalog(snapshot_path):
             CATALOG_DOWNLOAD_LOCK.release()
 
 
-def automatic_book_mood(book, google_key, yes24_key):
+def collect_book_documents(book, google_key, yes24_key, lookup_status):
     isbn = book_isbn(book)
     cache = st.session_state.setdefault("book_intro_recommendations", {})
-    if yes24_key and not isbn:
-        st.caption("이 장서의 ISBN을 확인할 수 없어 YES24 상세 정보를 조회하지 못했어요.")
-    if isbn and yes24_key:
-        cache_key = ("yes24", isbn)
+    documents = [("지샘터 책 소개", book.description)]
+    source_links = {}
+    sections = []
+    if not yes24_key:
+        lookup_status.caption("YES24 API 미조회 · API 키가 설정되지 않았어요.")
+    elif not isbn:
+        lookup_status.caption("YES24 API 미조회 · 장서 정보에서 유효한 ISBN을 확인할 수 없어요.")
+    else:
+        cache_key = ("yes24-text", isbn)
         if cache_key not in cache:
             try:
                 with st.spinner("YES24에서 같은 ISBN의 책을 찾고 있어요."):
-                    sections, link = yes24_book_text(isbn, yes24_key)
+                    cache[cache_key] = yes24_book_text(isbn, yes24_key)
             except CatalogError as error:
-                st.caption(str(error))
-            else:
-                recommendation = None
-                for label, value in sections:
-                    mood, terms, _ = infer_mood(Book(title="", description=value))
-                    if mood:
-                        recommendation = (mood, terms, [label], link, "YES24 도서 정보")
-                        break
-                cache[cache_key] = (recommendation, link, bool(sections))
+                lookup_status.caption(f"YES24 API 조회 오류 · {error}")
         if cache_key in cache:
-            recommendation, link, has_text = cache[cache_key]
-            if recommendation:
-                return recommendation
-            if link:
-                message = (
-                    "YES24 API 응답에서 추천에 쓸 분위기 단서를 찾지 못했어요."
-                    if has_text else "YES24 API의 줄거리·책 소개·목차가 비어 있어요."
-                )
-                if isbn in EDITION_NOTES:
-                    st.caption(message)
-                else:
-                    st.markdown(f"{message} [YES24 상품 페이지 보기]({link})")
+            sections, link, matched = cache[cache_key]
+            if sections:
+                lookup_status.caption(f"YES24 API 조회 성공 · 소개 자료 {len(sections)}종을 받았어요.")
+                for label, text in sections:
+                    source = f"YES24 {label}"
+                    documents.append((source, text))
+                    if link:
+                        source_links[source] = link
+            elif matched:
+                lookup_status.caption("YES24 API 조회 성공 · 같은 ISBN의 책을 찾았지만 소개 자료가 비어 있어요.")
             else:
-                st.caption("YES24 API에서 같은 ISBN의 결과를 받지 못했어요.")
+                lookup_status.caption("YES24 API 응답 수신 · 같은 ISBN의 도서가 반환되지 않았어요.")
     note = EDITION_NOTES.get(isbn)
     if note:
-        mood, terms, _ = infer_mood(Book(title="", description=note[0]))
-        if mood:
-            return mood, terms, [note[2]], note[1], note[2]
-    mood, terms, sources = infer_mood(book)
-    if mood:
-        return mood, terms, sources, "", "지샘터 도서정보"
-    if isbn and google_key:
-        cache_key = ("google", isbn)
+        text, link, source = note
+        documents.append((source, text))
+        source_links[source] = link
+    if isbn and google_key and not sections:
+        cache_key = ("google-text", isbn)
         if cache_key not in cache:
             try:
                 with st.spinner("같은 ISBN의 책 소개를 찾고 있어요."):
-                    description = google_book_intro(isbn, google_key)
+                    cache[cache_key] = google_book_intro(isbn, google_key)
             except CatalogError as error:
                 st.caption(str(error))
-            else:
-                cache[cache_key] = infer_mood(Book(title="", description=description))
-        if cache_key in cache:
-            mood, terms, sources = cache[cache_key]
-            if mood:
-                return mood, terms, sources, "", "Google Books"
-    return None, [], [], "", ""
+        if (description := cache.get(cache_key)):
+            documents.append(("Google Books 책 소개", description))
+    return documents, source_links
 
 
 def book_option_label(item):
@@ -326,38 +314,66 @@ def show_book_recommendation(folder, demo_books, routes):
     )
 
     with st.expander("내 감상이나 선호 반영하기"):
-        impression = st.text_input(
-            "책에서 기억에 남은 장면이나 느낌 (선택)",
+        book_key = (book.title, book.author, book.publisher, book.publication_year)
+        impression = st.text_area(
+            "내 감상문 (선택)",
             placeholder="예: 바다를 바라보는 고요한 장면",
-            key=f"impression-{book.title}-{book.author}-{book.publisher}-{book.publication_year}",
+            key=f"impression-{book_key}",
         ).strip()
-        available_moods = [mood for mood in MOODS if MOOD_ROUTES[mood] in routes]
+        extra_text = st.text_area(
+            "추가 자료 (선택)",
+            placeholder="책 소개, 줄거리, 출판사 리뷰 등을 붙여 넣으세요.",
+            key=f"book-evidence-{book_key}",
+        ).strip()
+        available_moods = [mood for mood, route in MOOD_ROUTES.items() if route in routes]
         selected_mood = st.selectbox("산책 분위기", ["책 정보에서 자동 추천", *available_moods])
 
-    evidence_url = evidence_name = ""
-    suggested_mood, terms, sources = infer_mood(book, impression) if impression else (None, [], [])
-    if selected_mood not in MOOD_ROUTES and not suggested_mood:
-        if from_catalog:
-            with lookup_details:
-                suggested_mood, terms, sources, evidence_url, evidence_name = automatic_book_mood(book, google_key, yes24_key)
-        else:
-            suggested_mood, terms, _ = infer_mood(book)
-            sources = ["입력한 문구"] if suggested_mood else []
     if selected_mood in MOOD_ROUTES:
         feature_id = MOOD_ROUTES[selected_mood]
         reason = f"선택한 분위기 · {selected_mood}. {ROUTE_REASONS[feature_id]}"
-    elif suggested_mood and MOOD_ROUTES[suggested_mood] in routes:
-        feature_id = MOOD_ROUTES[suggested_mood]
-        evidence = "·".join(sources)
-        reason = f"{evidence}에서 찾은 단서 · {', '.join(terms)}. {ROUTE_REASONS[feature_id]}"
     else:
-        feature_id = min(routes, key=lambda key: routes[key][1])
-        reason = "가볍게 시작하는 산책 · 가장 짧은 코스를 제안해요. 원하는 분위기를 선택해 코스를 바꿀 수도 있어요."
+        documents = [("독자 감상문", impression), ("직접 입력한 자료", extra_text)]
+        source_links = {}
+        if from_catalog:
+            lookup_status = st.empty()
+            with lookup_details:
+                book_documents, source_links = collect_book_documents(book, google_key, yes24_key, lookup_status)
+            documents.extend(book_documents)
+        matches = match_route_keywords(documents, routes)
+        used_metadata = not any(matches.values())
+        if used_metadata:
+            matches = match_route_keywords([
+                ("장서 제목" if from_catalog else "검색어", book.title),
+                ("장서 주제·주제어", " ".join((book.subject, book.keywords))),
+                ("장서 분류", book.category),
+            ], routes)
 
-    if evidence_url:
-        st.markdown(f"추천에 참고한 자료 · [{evidence_name}]({evidence_url})")
-    elif evidence_name:
-        st.caption(f"추천에 참고한 자료 · {evidence_name}")
+        count = max(map(len, matches.values()))
+        tied_routes = [route for route, hits in matches.items() if len(hits) == count]
+        feature_id = min(tied_routes, key=lambda route: routes[route][1])
+        if count:
+            hits = matches[feature_id]
+            words = ", ".join(list(hits)[:8])
+            if count > 8:
+                words += f" 외 {count - 8}개"
+            basis = "제목·주제 정보" if used_metadata else "책 자료·감상문"
+            reason = f"{basis} 기준 · 일치 단어 {count}개 ({words}). {ROUTE_REASONS[feature_id]}"
+            if len(tied_routes) > 1:
+                reason += " 동점인 코스 중 가장 짧은 길을 골랐어요."
+            sources = list(dict.fromkeys(source for found_in in hits.values() for source in found_in))
+            for source in sources:
+                if source in source_links:
+                    st.markdown(f"추천에 사용한 자료 · [{source}]({source_links[source]})")
+            with st.expander("코스별 일치 단어와 추천 근거"):
+                for route, route_hits in matches.items():
+                    words = ", ".join(route_hits)
+                    st.write(f"{routes[route][0]} · {len(route_hits)}개" + (f" · {words}" if words else ""))
+                st.caption("선택된 코스의 단어별 출처")
+                for term, found_in in hits.items():
+                    st.write(f"{term} · {', '.join(found_in)}")
+        else:
+            reason = "일치하는 단어가 없어 가장 짧은 코스를 안내해요. 감상문이나 책 소개를 추가해 다시 추천받을 수 있어요."
+
     name, distance = routes[feature_id]
     return name, distance, feature_id, reason
 

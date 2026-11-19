@@ -21,6 +21,11 @@ CATALOG_DOWNLOAD_LOCK = Lock()
 
 # Short editorial notes keyed by the exact edition in the library catalog.
 EDITION_NOTES = {
+    "9788964475256": (
+        "농촌 교회가 농사, 복지, 교육을 통해 이웃과 함께 마을 공동체를 돌본 사례를 소개한다.",
+        "https://www.yes24.com/product/goods/78895002",
+        "YES24 상품 페이지 목차 요약",
+    ),
     "9788952784933": (
         "할리우드 감독이 나무 집을 영화로 만들러 오고, 기발한 장치가 가득한 집에서 엉뚱한 소동이 벌어진다.",
         "https://www.yes24.com/product/goods/35244690",
@@ -524,19 +529,21 @@ def yes24_book_text(isbn, api_key):
         lookups.append(("ItemId", note[1].rsplit("/", 1)[-1]))
 
     matched_link = ""
+    matched = False
     for search_type, query in lookups:
         for item in yes24_items(search_type, query, api_key):
             if re.sub(r"[\s-]", "", str(item.get("isbn13", ""))) != isbn:
                 continue
+            matched = True
             content = item.get("contentDetail") or {}
             sections = [
-                (label, plain_text(content.get(field) or ""))
+                (label, text)
                 for field, label in (
                     ("bookSummary", "줄거리"),
                     ("bookIntroduction", "책 소개"),
                     ("tableOfContents", "목차"),
                 )
-                if content.get(field)
+                if (text := plain_text(content.get(field) or "").strip())
             ]
             link = item.get("link") or ""
             if not re.fullmatch(r"https://(?:www\.)?yes24\.com/product/goods/\d+/?", link, re.I):
@@ -546,22 +553,75 @@ def yes24_book_text(isbn, api_key):
                     if re.fullmatch(r"[1-9]\d*", item_id)
                     else (note[1] if note else "")
                 )
-            if link:
-                matched_link = link
-                if sections:
-                    return sections, link
-    return [], matched_link
+            matched_link = link or matched_link
+            if sections:
+                return sections, matched_link, True
+    return [], matched_link, matched
 
 
-MOODS = {
-    "계절과 자연 관찰": ("계절", "제철", "야생화", "꽃", "정원", "식물", "숲", "자연 관찰", "기후", "생태"),
-    "물가와 차분한 사색": ("물결", "바다", "물가", "호수", "하천", "고요", "차분", "잔잔", "휴식", "흐른다", "강가"),
-    "역사와 옛 풍경": ("고대", "백제", "역사", "전통", "유적", "문화유산", "옛날", "고고학"),
-    "사랑과 사람 이야기": ("사랑", "우정", "연인", "함께", "가족", "관계", "편지", "행복하다는"),
-    "도전과 활기": ("도전", "모험", "운동", "달리기", "자전거", "여행", "새로운 시작", "스포츠", "성장", "기발", "엉뚱", "말장난"),
-    "기억과 돌아봄": ("추억", "기억", "회고", "철학", "성찰", "되돌아", "사색", "일상"),
-    "문학과 이야기": ("문학기행", "문학여행", "소설", "동화", "시집", "수필", "에세이", "그림책"),
+ROUTE_KEYWORDS = {
+    "lakeside-walk": tuple(term.replace("_", " ") for term in """
+        바다 물결 물가 호수 연못 하천 강가 호숫가 물안개 수면
+        파도 해안 해변 바닷가 포구 갯벌 섬 물빛 윤슬 잔물결
+        물소리 빗소리 노을 석양 새벽 달빛 별빛 별밤 수평선 지평선
+        고요 평온 차분 잔잔 적막 침묵 고즈넉 여유 휴식 휴양
+        명상 사유 고독 외로움 위로 치유 안식 쉼 안도 마음챙김
+        숨고르기 심호흡 느림 천천히 나지막 정적 고요함 정갈함 포근함 느긋함
+        물풀 수련 가시연잎 갈대 수초 물새 오리 백조 잉어 고래
+        조개 모래밭 자갈밭 강물 샘물 냇물 시냇물 빗물 개울 폭포
+        호반 강변 둔치 수변 계곡 물줄기 조수 밀물 썰물 풍랑
+        소나기 이슬비 안개비 잠수 부표 돛단배 나룻배 뱃길 잔향 여운
+    """.split()),
+    "fortress-walk": tuple(term.replace("_", " ") for term in """
+        역사 고대 백제 전통 유적 문화유산 옛날 고고학 선사 유물
+        토성 산성 성곽 성벽 성문 고분 왕릉 무덤 사적 유산
+        발굴 답사 기행 고증 복원 보존 기록물 사료 문헌 연대기
+        조선 고려 고구려 신라 삼국 가야 통일신라 대한제국 일제강점기 중세
+        근대 현대사 고대사 한국사 세계사 왕국 제국 왕조 국왕 왕실
+        궁궐 왕궁 궁성 도읍 한성 도성 왕위 왕권 왕세자 조정
+        전쟁 전투 방어 군영 보루 봉수대 요새 성터 옛터 유적지
+        토기 청동기 석기 철기 움집 움집터 고인돌 도자기 기와 비석
+        비문 금석문 옛_지도 족보 사당 서원 향교 한옥 종묘 전각
+        전승 설화 민속 풍속 관습 의례 제례 역사관 몽촌토성 시대상
+    """.split()),
+    "memory-walk": tuple(term.replace("_", " ") for term in """
+        추억 기억 회고 철학 성찰 되돌아 사색 일상 유년 어린_시절
+        옛친구 향수 고향 귀향 재회 회상 자서전 회고록 일기 수기
+        기록 그리움 잊혀짐 아련함 지난여름 세월 시간 흘러간 첫_기억 오래전
+        계절 제철 야생화 꽃 정원 식물 숲 자연_관찰 기후 생태
+        봄 여름 가을 겨울 단풍 낙엽 새싹 꽃잎 꽃망울 풀잎
+        나무 나이테 풀꽃 들꽃 민들레 제비꽃 진달래 개나리 국화 코스모스
+        곤충 나비 벌레 꽃가루 향기 흙냄새 숲길 오솔길 나무_그늘 나들이
+        문학기행 문학여행 소설 동화 시집 수필 에세이 그림책 시인 작가
+        책장 책갈피 낭독 독서 이야기책 장면 문장 문학 글쓰기 글귀
+        발자취 지난날 오늘 옛사진 앨범 추억담 회한 자책 후회 회복
+    """.split()),
+    "lovers-walk": tuple(term.replace("_", " ") for term in """
+        사랑 우정 연인 가족 관계 편지 공동체 마을목회 이웃 연애
+        설렘 첫사랑 짝사랑 고백 청혼 약혼 결혼 신혼 부부 배우자
+        데이트 만남 이별 헤어짐 애정 애틋함 다정함 달콤함 애틋 다정
+        손길 손잡기 포옹 입맞춤 눈맞춤 미소 웃음 장난 다독임 보살핌
+        돌봄 배려 공감 존중 신뢰 동행 동반자 벗 친구 우애
+        형제 자매 남매 부모 조부모 할머니 할아버지 손주 자녀 아이들
+        가정 우리집 친척 식구 가족사진 나눔 봉사 협동 연대 상생
+        마을_공동체 주민 지역사회 마을_사람 대화 소통 화해 용서 이해 감사
+        축하 응원 격려 마음 따뜻함 행복 기념일 축제 선물 꽃다발
+        예술 미술 조각 전시 미술관 예술가 그림_전시 공연 노래 합창
+    """.split()),
+    "youth-walk": tuple(term.replace("_", " ") for term in """
+        도전 모험 운동 달리기 자전거 여행 새출발 스포츠 성장 기발
+        엉뚱 말장난 활동 활기 생동감 에너지 체력 열정 용기 도약
+        도전정신 개척 탐험 원정 탐사 미지의_세계 탐험가 미션 임무 발견
+        수수께끼 추리 모험담 상상력 판타지 신비 마법 비행 우주 탈출
+        위기 극복 해결책 발명 실험 발명품 발상 창의력 호기심 학습
+        경기 대회 경쟁 승부 승리 패배 우승 메달 선수 코치
+        기록_경신 달리기_대회 단거리 장거리 마라톤 조깅 걷기_경주 릴레이 완주 페이스
+        질주 속도 출발선 결승선 등산 트레킹 하이킹 야영 캠핑 사이클
+        축구 야구 농구 배구 테니스 수영 체조 태권도 훈련 연습
+        진로 꿈 목표 노력 끈기 인내 성취 자립 전환 가능성
+    """.split()),
 }
+
 
 MOOD_ROUTES = {
     "계절과 자연 관찰": "memory-walk",
@@ -582,34 +642,36 @@ ROUTE_REASONS = {
 }
 
 
-def infer_mood(book, impression=""):
-    book_text = (
-        (("독자 감상", normalized(impression), 1),)
-        if impression else (
-            ("책 소개", normalized(book.description), 3),
-            ("주제·주제어", normalized(" ".join((book.keywords, book.subject))), 4),
-            ("제목", normalized(book.title), 2),
-            ("분류", normalized(book.category), 1),
-        )
-    )
-    scores = {}
-    for mood, keywords in MOODS.items():
-        hits = {}
-        for term in keywords:
-            key = normalized(term)
-            evidence = [(source, weight) for source, field, weight in book_text if key in field]
-            if evidence:
-                hits[term] = (sum(weight for _, weight in evidence), [source for source, _ in evidence])
-        scores[mood] = (
-            sum(weight for weight, _ in hits.values()),
-            sorted(hits, key=lambda term: hits[term][0], reverse=True)[:4],
-            hits,
-        )
 
-    best = max(scores, key=lambda mood: scores[mood][0])
-    score, terms, evidence = scores[best]
-    tied_routes = {MOOD_ROUTES[mood] for mood, (value, _, _) in scores.items() if value == score}
-    if score == 0 or len(tied_routes) > 1:
-        return None, [], []
-    sources = list(dict.fromkeys(source for term in terms for source in evidence[term][1]))
-    return best, terms, sources
+# Match complete words, allowing common Korean particles and inflections.
+KOREAN_SUFFIX = (
+    r"(?:에서부터|에게서|으로는|에서는|으로도|까지만|이라고|이라는|으로|에서|에게|한테|께서|"
+    r"까지|부터|처럼|마다|조차|마저|보다|이나|이며|이라|하고|하다|했던|했다|"
+    r"하기|하여|하게|합니다|한다|한|할|해|했다가|적인|적|들이|들을|들의|"
+    r"들|은|는|이|가|을|를|의|에|도|만|와|과|로)?"
+)
+KEYWORD_PATTERNS = {
+    route: [
+        (term, re.compile(r"(?<!\S)" + r"\s*".join(re.escape(word) for word in term.split())
+                         + KOREAN_SUFFIX + r"(?!\S)"))
+        for term in terms
+    ]
+    for route, terms in ROUTE_KEYWORDS.items()
+}
+
+
+def match_route_keywords(documents, route_ids):
+    text_by_source = [
+        (source, re.sub(r"[\W_]+", " ", unicodedata.normalize("NFKC", text).casefold()))
+        for source, text in documents if text
+    ]
+    matches = {}
+    for route in route_ids:
+        route_hits = {}
+        for term, pattern in KEYWORD_PATTERNS.get(route, []):
+            sources = tuple(dict.fromkeys(source for source, text in text_by_source if pattern.search(text)))
+            if sources:
+                route_hits[term] = sources
+        matches[route] = route_hits
+    return matches
+
