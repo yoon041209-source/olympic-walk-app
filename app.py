@@ -3,7 +3,6 @@ import os
 import sys
 from contextlib import closing
 from html import escape
-from math import cos, radians
 from pathlib import Path
 
 # QGIS에 포함된 Windows Python에서 SQLite DLL을 찾을 수 있게 합니다.
@@ -15,7 +14,6 @@ import sqlite3
 
 import pydeck as pdk
 import streamlit as st
-from PIL import Image, ImageDraw
 
 from catalog import Book, MOODS, MOOD_ROUTES, ROUTE_REASONS, infer_mood, normalized, official_book_url, read_catalog
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
@@ -360,58 +358,21 @@ def cached_catalog(files):
     return read_catalog(files)
 
 
-PARK_PHOTOS = {
-    "평화의광장": (
-        "peace-plaza.jpg",
-        "https://commons.wikimedia.org/wiki/File:Peace_Plaza_in_Seoul.jpg",
-        "Christophe95",
-        "CC BY-SA 4.0",
-        "https://creativecommons.org/licenses/by-sa/4.0/",
-    ),
-    "소마미술관": (
-        "soma-museum.jpg",
-        "https://commons.wikimedia.org/wiki/File:SOMA_museum.jpg",
-        "주전자",
-        "퍼블릭 도메인",
-        "https://commons.wikimedia.org/wiki/Template:PD-self",
-    ),
-}
-
-
-def show_waypoint_image(point, coordinates):
-    st.markdown(f"**{point['name']}**")
-    photo = PARK_PHOTOS.get(point["name"])
-    if photo:
-        filename, source, photographer, license_name, license_url = photo
-        path = Path(__file__).resolve().parent / "park_photos" / filename
-        if path.is_file():
-            st.image(str(path), width=480)
-            st.markdown(f"사진 · [{photographer} / Wikimedia Commons]({source}) · [{license_name}]({license_url})")
+def show_waypoint_photos(point):
+    name = point["name"]
+    st.markdown(f"**{name}**")
+    photo_folder_name = "몽촌토성" if "몽촌토성" in name else name
+    photo_folder = Path(__file__).resolve().parent / "park_photos" / photo_folder_name
+    if photo_folder.is_dir():
+        photos = sorted(
+            (path for path in photo_folder.iterdir()
+             if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}),
+            key=lambda path: (path.name.casefold(), path.name),
+        )
+        if photos:
+            st.image([str(path) for path in photos], width=320)
             return
-
-    longitude, latitude = point["position"]
-    longitude_scale = cos(radians(latitude))
-    offsets = [((lon - longitude) * longitude_scale, lat - latitude) for lon, lat in coordinates]
-    # Include the selected point in the preview bounds even when it lies beside the trail.
-    east, north = zip(*offsets, (0, 0))
-    width, height, padding = 480, 240, 25
-    scale = min(
-        (width - 2 * padding) / max(max(east) - min(east), 1e-6),
-        (height - 2 * padding) / max(max(north) - min(north), 1e-6),
-    )
-    center_x = (min(east) + max(east)) / 2
-    center_y = (min(north) + max(north)) / 2
-    preview = Image.new("RGB", (width, height), "#e8f2ff")
-    draw = ImageDraw.Draw(preview)
-    draw.line(
-        [(width / 2 + (x - center_x) * scale, height / 2 - (y - center_y) * scale) for x, y in offsets],
-        fill="#126f4d",
-        width=4,
-        joint="curve",
-    )
-    x, y = width / 2 - center_x * scale, height / 2 + center_y * scale
-    draw.ellipse((x - 8, y - 8, x + 8, y + 8), fill="#135bb3", outline="white", width=2)
-    st.image(preview, caption="코스 내 위치 안내 이미지", width=480)
+    st.caption("등록된 사진이 없어요.")
 
 
 def show_map(name, feature_id, coordinates, waypoints):
@@ -449,7 +410,7 @@ def show_map(name, feature_id, coordinates, waypoints):
             })
     marker_layer_id = f"{feature_id}-waypoints"
     if points:
-        st.caption("주황색은 출발점이에요. 번호가 있는 지점을 누르면 지도 아래에 이미지가 나타나요.")
+        st.caption("주황색은 출발점이에요. 번호가 있는 지점을 누르면 지도 아래에서 사진을 볼 수 있어요.")
         layers.extend([
             pdk.Layer(
                 "ScatterplotLayer",
@@ -492,7 +453,7 @@ def show_map(name, feature_id, coordinates, waypoints):
     )
     selected = event.selection.objects.get(marker_layer_id, [])
     if selected and (point := points.get(selected[0].get("name"))):
-        show_waypoint_image(point, coordinates)
+        show_waypoint_photos(point)
 
 
 st.set_page_config(page_title=TITLE)
