@@ -164,17 +164,19 @@ class Yes24Page(HTMLParser):
             self.depth -= 1
 
 
-def yes24_page_html(client, url):
+def yes24_page_html(client, url, stage):
     import httpx
 
     try:
         response = client.get(url)
-    except httpx.TimeoutException:
-        raise CatalogError("YES24 웹페이지 응답 시간이 초과됐어요.") from None
+    except httpx.ConnectTimeout:
+        raise CatalogError(f"YES24 {stage}에 연결하는 시간이 초과됐어요.") from None
+    except httpx.ReadTimeout:
+        raise CatalogError(f"YES24 {stage}의 응답을 기다리다 시간이 초과됐어요.") from None
     except httpx.RequestError:
-        raise CatalogError("YES24 웹사이트에 연결하지 못했어요.") from None
+        raise CatalogError(f"YES24 {stage}에 요청을 보내지 못했어요.") from None
     if response.status_code != 200:
-        raise CatalogError(f"YES24 웹사이트가 HTTP {response.status_code}를 반환했어요.")
+        raise CatalogError(f"YES24 {stage}에서 HTTP {response.status_code}를 반환했어요.")
     return response.text
 
 
@@ -186,9 +188,9 @@ def yes24_web_book_text(book):
     author_words = set(re.findall(r"[^\W_]+", book.author.split(" 외", 1)[0].casefold()))
     queries = ([isbn] if isbn else []) + [yes24_title_query(book)]
     seen = set()
-    with httpx.Client(timeout=httpx.Timeout(6, connect=3), follow_redirects=False) as client:
+    with httpx.Client(timeout=httpx.Timeout(10, connect=3), follow_redirects=False) as client:
         for query in dict.fromkeys(filter(None, queries)):
-            search = Yes24Page(yes24_page_html(client, yes24_search_url(query)))
+            search = Yes24Page(yes24_page_html(client, yes24_search_url(query), "검색 페이지"))
             if query == isbn:
                 candidates = list(search.matches)
             else:
@@ -197,7 +199,7 @@ def yes24_web_book_text(book):
             for item in candidates:
                 seen.add(item)
                 link = f"{YES24_SITE}/product/goods/{item}"
-                html = yes24_page_html(client, link)
+                html = yes24_page_html(client, link, "상품 상세 페이지")
                 page = Yes24Page(html)
                 match = re.search(r">\s*ISBN13\s*</th>\s*<td\b[^>]*>\s*(97[89]\d{10})\s*</td>", html, re.I)
                 if isbn and match:
