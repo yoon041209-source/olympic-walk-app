@@ -1,11 +1,14 @@
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
 from time import monotonic
+from urllib.parse import urlencode
 
 # QGIS에 포함된 Windows Python에서 SQLite DLL을 찾을 수 있게 합니다.
 qgis_folder = Path(sys.base_prefix).parent.parent
@@ -20,7 +23,7 @@ import streamlit as st
 from catalog import Book, MOOD_ROUTES, ROUTE_REASONS, match_route_keywords, normalized, official_book_url, read_catalog
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
 from catalog import EDITION_NOTES, book_isbn, google_book_intro
-from catalog import yes24_search_url, yes24_title_query, yes24_web_book_text
+from catalog import number_search_text, plain_text
 from catalog import build_search_index, search_books
 from semantic_routes import MIN_MARGIN, SemanticUnavailable, collect_sentences, load_semantic_model
 
@@ -90,6 +93,125 @@ def update_catalog(snapshot_path):
                     st.warning("임시 페이지를 지울 수 없어요. 다음 갱신 때 처음부터 다시 받기를 선택해 주세요.")
         finally:
             CATALOG_DOWNLOAD_LOCK.release()
+
+
+YES24_SITE = "https://www.yes24.com"
+
+
+def yes24_search_url(query):
+    return f"{YES24_SITE}/Product/Search?{urlencode({'domain': 'ALL', 'query': query})}"
+
+
+def yes24_title_query(book):
+    author = book.author.split(" 외", 1)[0].strip()
+    return " ".join((number_search_text(book.title), author)).strip()
+
+
+class Yes24Page(HTMLParser):
+    SECTION_NAMES = {
+        "infoset_introduce": "책 소개",
+        "infoset_pubreivew": "출판사 리뷰",
+        "infoset_pubreview": "출판사 리뷰",
+    }
+
+    def __init__(self, html):
+        super().__init__(convert_charrefs=True)
+        self.matches = {}
+        self.sections = {}
+        self.product_title = ""
+        self.product_author = ""
+        self.depth = 0
+        self.section = None
+        self.capture = None
+        self.feed(html)
+        self.close()
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        classes = (attrs.get("class") or "").split()
+        if tag == "div":
+            self.depth += 1
+            section_name = self.SECTION_NAMES.get((attrs.get("id") or "").lower())
+            if section_name:
+                self.section = self.depth, section_name
+        if tag == "meta" and attrs.get("property") == "og:title":
+            parts = (attrs.get("content") or "").split(" | ")
+            if len(parts) >= 3:
+                self.product_title, self.product_author = parts[:2]
+        if tag == "a" and "gd_name" in classes:
+            match = re.fullmatch(r"(?:https://www\.yes24\.com)?/product/goods/(\d+)(?:\?[^#]*)?", attrs.get("href") or "", re.I)
+            if match:
+                self.capture = tag, match[1], []
+        if self.section and tag == "textarea" and "txtContentText" in classes:
+            self.capture = tag, self.section[1], []
+
+    def handle_data(self, text):
+        if self.capture:
+            self.capture[2].append(text)
+
+    def handle_endtag(self, tag):
+        if self.capture and self.capture[0] == tag:
+            _, key, parts = self.capture
+            self.capture = None
+            text = plain_text("".join(parts))
+            if text and tag == "textarea":
+                self.sections.setdefault(key, text[:6000])
+            elif text:
+                self.matches.setdefault(key, text)
+        if tag == "div":
+            if self.section and self.section[0] == self.depth:
+                self.section = None
+            self.depth -= 1
+
+
+def yes24_page_html(client, url):
+    import httpx
+
+    try:
+        response = client.get(url)
+    except httpx.TimeoutException:
+        raise CatalogError("YES24 웹페이지 응답 시간이 초과됐어요.") from None
+    except httpx.RequestError:
+        raise CatalogError("YES24 웹사이트에 연결하지 못했어요.") from None
+    if response.status_code != 200:
+        raise CatalogError(f"YES24 웹사이트가 HTTP {response.status_code}를 반환했어요.")
+    return response.text
+
+
+def yes24_web_book_text(book):
+    import httpx
+
+    isbn = book_isbn(book)
+    title = normalized(number_search_text(book.title))
+    author_words = set(re.findall(r"[^\W_]+", book.author.split(" 외", 1)[0].casefold()))
+    queries = ([isbn] if isbn else []) + [yes24_title_query(book)]
+    seen = set()
+    with httpx.Client(timeout=httpx.Timeout(6, connect=3), follow_redirects=False) as client:
+        for query in dict.fromkeys(filter(None, queries)):
+            search = Yes24Page(yes24_page_html(client, yes24_search_url(query)))
+            if query == isbn:
+                candidates = list(search.matches)
+            else:
+                candidates = [item for item, name in search.matches.items() if normalized(number_search_text(name)) == title]
+            candidates = [item for item in candidates if item not in seen][:2]
+            for item in candidates:
+                seen.add(item)
+                link = f"{YES24_SITE}/product/goods/{item}"
+                html = yes24_page_html(client, link)
+                page = Yes24Page(html)
+                match = re.search(r">\s*ISBN13\s*</th>\s*<td\b[^>]*>\s*(97[89]\d{10})\s*</td>", html, re.I)
+                if isbn and match:
+                    same_book = match[1] == isbn
+                else:
+                    author = set(re.findall(r"[^\W_]+", page.product_author.casefold()))
+                    same_book = (
+                        bool(author_words)
+                        and author_words <= author
+                        and normalized(number_search_text(page.product_title)) == title
+                    )
+                if same_book:
+                    return list(page.sections.items()), link
+    return [], ""
 
 
 @st.cache_resource(show_spinner=False)
