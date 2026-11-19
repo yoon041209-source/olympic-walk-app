@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from html import escape
 from pathlib import Path
@@ -92,62 +93,105 @@ def update_catalog(snapshot_path):
             CATALOG_DOWNLOAD_LOCK.release()
 
 
+@st.cache_resource(show_spinner=False)
+def book_lookup_executor():
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="book-lookup")
+
+
+def fetch_book_documents(isbn, google_key, yes24_key):
+    sections, link, matched = [], "", False
+    yes24_error = google_error = description = ""
+    if yes24_key:
+        try:
+            sections, link, matched = yes24_book_text(isbn, yes24_key)
+        except CatalogError as error:
+            yes24_error = str(error)
+    if google_key and not sections:
+        try:
+            description = google_book_intro(isbn, google_key)
+        except CatalogError as error:
+            google_error = str(error)
+    return sections, link, matched, yes24_error, description, google_error
+
+
+def cancel_book_lookup():
+    pending = st.session_state.pop("pending_book_lookup", None)
+    if pending:
+        pending[1].cancel()
+
+
+@st.fragment(run_every=0.75)
+def refresh_when_books_arrive(future):
+    if future.done():
+        st.rerun()
+
+
 def collect_book_documents(book, google_key, yes24_key, lookup_status, external_lookup):
     isbn = book_isbn(book)
-    cache = st.session_state.setdefault("book_intro_recommendations", {})
     documents = [("지샘터 책 소개", book.description)]
     source_links = {}
-    sections = []
-    if not external_lookup:
-        lookup_status.caption("외부 책 소개 조회를 끈 상태예요.")
-    elif not yes24_key:
-        lookup_status.caption("YES24 API 미조회 · API 키가 설정되지 않았어요.")
-    elif not isbn:
-        lookup_status.caption("YES24 API 미조회 · 장서 정보에서 유효한 ISBN을 확인할 수 없어요.")
-    else:
-        cache_key = ("yes24-text", isbn)
-        error_key = ("yes24-error", isbn)
-        retry_at, error_message = cache.get(error_key, (0, ""))
-        if retry_at > monotonic():
-            lookup_status.caption(f"YES24 API 조회 오류 · {error_message}")
-        elif cache_key not in cache:
-            try:
-                with st.spinner("YES24에서 같은 ISBN의 책을 찾고 있어요."):
-                    cache[cache_key] = yes24_book_text(isbn, yes24_key)
-            except CatalogError as error:
-                error_message = str(error)
-                cache[error_key] = (monotonic() + 30, error_message)
-                lookup_status.caption(f"YES24 API 조회 오류 · {error_message}")
-            else:
-                cache.pop(error_key, None)
-        if cache_key in cache:
-            sections, link, matched = cache[cache_key]
-            if sections:
-                lookup_status.caption(f"YES24 API 조회 성공 · 소개 자료 {len(sections)}종을 받았어요.")
-                for label, text in sections:
-                    source = f"YES24 {label}"
-                    documents.append((source, text))
-                    if link:
-                        source_links[source] = link
-            elif matched:
-                lookup_status.caption("YES24 API 조회 성공 · 같은 ISBN의 책을 찾았지만 소개 자료가 비어 있어요.")
-            else:
-                lookup_status.caption("YES24 API 응답 수신 · 같은 ISBN의 도서가 반환되지 않았어요.")
     note = EDITION_NOTES.get(isbn)
     if note:
         text, link, source = note
         documents.append((source, text))
         source_links[source] = link
-    if external_lookup and isbn and google_key and not sections:
-        cache_key = ("google-text", isbn)
-        if cache_key not in cache:
-            try:
-                with st.spinner("같은 ISBN의 책 소개를 찾고 있어요."):
-                    cache[cache_key] = google_book_intro(isbn, google_key)
-            except CatalogError as error:
-                st.caption(str(error))
-        if (description := cache.get(cache_key)):
-            documents.append(("Google Books 책 소개", description))
+    if not external_lookup or not isbn or not (yes24_key or google_key):
+        cancel_book_lookup()
+        if not external_lookup:
+            lookup_status.caption("외부 책 소개 조회를 끈 상태예요.")
+        elif not isbn:
+            lookup_status.caption("외부 책 소개 미조회 · 장서 정보에서 유효한 ISBN을 확인할 수 없어요.")
+        else:
+            lookup_status.caption("외부 책 소개 미조회 · API 키가 설정되지 않았어요.")
+        return documents, source_links
+
+    cache = st.session_state.setdefault("book_intro_recommendations", {})
+    cache_key = ("external-text", isbn)
+    expires_at, result = cache.get(cache_key, (0, None))
+    pending = st.session_state.get("pending_book_lookup")
+    if pending and pending[0] != cache_key:
+        cancel_book_lookup()
+        pending = None
+
+    if expires_at <= monotonic():
+        if pending is None:
+            future = book_lookup_executor().submit(fetch_book_documents, isbn, google_key, yes24_key)
+            st.session_state["pending_book_lookup"] = (cache_key, future)
+        else:
+            future = pending[1]
+        if not future.done():
+            lookup_status.caption("외부 책 소개를 확인 중이에요. 먼저 현재 자료로 추천을 보여드려요.")
+            refresh_when_books_arrive(future)
+            return documents, source_links
+        st.session_state.pop("pending_book_lookup", None)
+        try:
+            result = future.result()
+        except Exception:
+            error_message = "외부 서비스 응답을 처리하지 못했어요."
+            result = [], "", False, error_message if yes24_key else "", "", error_message
+        ttl = 30 if result[3] or result[5] else float("inf")
+        cache[cache_key] = (monotonic() + ttl, result)
+
+    sections, link, matched, yes24_error, description, google_error = result
+    if yes24_error:
+        lookup_status.caption(f"YES24 API 조회 오류 · {yes24_error}")
+    elif sections:
+        lookup_status.caption(f"YES24 API 조회 성공 · 소개 자료 {len(sections)}종을 받았어요.")
+        for label, text in sections:
+            source = f"YES24 {label}"
+            documents.append((source, text))
+            if link:
+                source_links[source] = link
+    elif matched:
+        lookup_status.caption("YES24 API 조회 성공 · 같은 ISBN의 책을 찾았지만 소개 자료가 비어 있어요.")
+    elif yes24_key:
+        lookup_status.caption("YES24 API 응답 수신 · 같은 ISBN의 도서가 반환되지 않았어요.")
+    if description:
+        documents.append(("Google Books 책 소개", description))
+        if not yes24_key:
+            lookup_status.caption("Google Books에서 책 소개를 받았어요.")
+    elif google_error and not yes24_key:
+        lookup_status.caption(f"Google Books 조회 오류 · {google_error}")
     return documents, source_links
 
 
@@ -385,6 +429,7 @@ def show_book_recommendation(folder, demo_books, routes):
                         st.success("YES24 키를 저장했어요. 앱을 다시 실행해도 자동으로 연결해요.")
             st.session_state["google_books_api_key"] = google_key.strip()
             st.session_state.pop("book_intro_recommendations", None)
+            cancel_book_lookup()
         if key_path is not None and key_path.is_file() and st.button("저장한 YES24 키 삭제"):
             try:
                 key_path.unlink(missing_ok=True)
@@ -393,6 +438,7 @@ def show_book_recommendation(folder, demo_books, routes):
             else:
                 st.session_state.pop("yes24_book_api_key", None)
                 st.session_state.pop("book_intro_recommendations", None)
+                cancel_book_lookup()
                 st.rerun()
         external_lookup = st.toggle("외부 책 소개 자동 조회", value=True)
         lookup_details = st.container()
@@ -422,6 +468,7 @@ def show_book_recommendation(folder, demo_books, routes):
         selected_mood = st.selectbox("산책 분위기", ["책 정보에서 자동 추천", *available_moods])
 
     if selected_mood in MOOD_ROUTES:
+        cancel_book_lookup()
         feature_id = MOOD_ROUTES[selected_mood]
         reason = f"선택한 분위기 · {selected_mood}. {ROUTE_REASONS[feature_id]}"
     else:
@@ -429,11 +476,12 @@ def show_book_recommendation(folder, demo_books, routes):
         source_links = {}
         if from_catalog:
             lookup_status = st.empty()
-            with lookup_details:
-                book_documents, source_links = collect_book_documents(
-                    book, google_key, yes24_key, lookup_status, external_lookup
-                )
+            book_documents, source_links = collect_book_documents(
+                book, google_key, yes24_key, lookup_status, external_lookup
+            )
             documents.extend(book_documents)
+        else:
+            cancel_book_lookup()
         semantic = recommend_by_sentence(documents, routes, source_links)
         if semantic:
             feature_id, reason = semantic
