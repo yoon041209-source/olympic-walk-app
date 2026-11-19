@@ -21,6 +21,7 @@ from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_
 from catalog import EDITION_NOTES, book_isbn, google_book_intro, yes24_book_text
 from catalog import load_yes24_key, save_yes24_key, yes24_key_path
 from catalog import build_search_index, search_books
+from semantic_routes import MIN_MARGIN, SemanticUnavailable, collect_sentences, load_semantic_model
 
 
 TITLE = "책 한 권으로 시작하는 올림픽공원 산책"
@@ -153,6 +154,50 @@ def book_option_label(item):
     if isinstance(item, str):
         return item
     return " · ".join(part for part in (item.title, item.author, item.publisher, item.isbn) if part)
+
+
+@st.cache_resource(show_spinner=False)
+def semantic_model():
+    return load_semantic_model()
+
+
+def recommend_by_sentence(documents, routes, source_links):
+    sentences = collect_sentences(documents)
+    if not sentences:
+        return None
+    if st.session_state.get("semantic_retry_at", 0) > monotonic():
+        st.caption("문장 모델을 불러오지 못해 키워드로 추천해요.")
+        return None
+
+    cache_key = (sentences, tuple(routes))
+    previous = st.session_state.get("semantic_ranking")
+    if previous and previous[0] == cache_key:
+        ranking = previous[1]
+    else:
+        try:
+            with st.spinner("책의 문장과 산책 코스의 분위기를 비교하고 있어요."):
+                ranking = semantic_model().rank(sentences, routes)
+        except SemanticUnavailable:
+            st.session_state["semantic_retry_at"] = monotonic() + 60
+            st.caption("문장 모델을 불러오지 못해 키워드로 추천해요.")
+            return None
+        st.session_state["semantic_ranking"] = (cache_key, ranking)
+
+    winner = ranking[0]
+    if len(ranking) > 1 and winner.score - ranking[1].score < MIN_MARGIN:
+        st.caption("문장 점수가 비슷해 키워드도 비교해서 추천해요.")
+        return None
+
+    with st.expander("코스별 문장 점수와 추천 근거"):
+        st.caption("문장마다 다섯 코스의 평균을 기준으로 계산한 상대 유사도예요.")
+        for result in ranking:
+            st.write(f"{routes[result.route][0]} · {result.score:+.3f}")
+        for sentence in winner.evidence:
+            st.caption(sentence.source)
+            st.text(sentence.text)
+            if sentence.source in source_links:
+                st.markdown(f"[자료 보기]({source_links[sentence.source]})")
+    return winner.route, f"문장 의미 기준 · 상대 유사도 {winner.score:+.3f}. {ROUTE_REASONS[winner.route]}"
 
 
 def show_book_recommendation(folder, demo_books, routes):
@@ -362,6 +407,12 @@ def show_book_recommendation(folder, demo_books, routes):
                     book, google_key, yes24_key, lookup_status, external_lookup
                 )
             documents.extend(book_documents)
+        semantic = recommend_by_sentence(documents, routes, source_links)
+        if semantic:
+            feature_id, reason = semantic
+            name, distance = routes[feature_id]
+            return name, distance, feature_id, reason
+
         matches = match_route_keywords(documents, routes)
         used_metadata = not any(matches.values())
         if used_metadata:
