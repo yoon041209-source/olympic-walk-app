@@ -466,6 +466,22 @@ def show_map(name, feature_id, coordinates, waypoints):
 
 
 st.set_page_config(page_title=TITLE)
+st.html("""
+<style>
+:root, .stApp { color-scheme: only light; }
+.stApp [data-testid="stWidgetLabel"],
+.stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-testid="stRadio"] [role="radiogroup"] p {
+    color: #162d49;
+}
+.stApp [data-baseweb="input"] input::placeholder,
+.stApp [data-baseweb="select"] input::placeholder,
+.stApp [data-baseweb="textarea"] textarea::placeholder {
+    color: #50637b;
+    opacity: 1;
+}
+</style>
+""")
 st.html('<style>\n.stApp, [data-testid="stHeader"] { background: #eceff3; color: #162d49; }\n[data-testid="stMainBlockContainer"] { max-width: 1000px; }\n.stApp h1 { background: #174a86; color: white; border-radius: 16px; padding: 1.35rem 1.6rem; }\n.stApp h2, .stApp h3 { color: #173d68; }\n.stApp div[class*="st-key-walk-design-"] {\n    background: #f6faff; border: 1px solid #b8cce5; border-radius: 16px;\n    box-shadow: 0 3px 12px #1533580a;\n}\n.stApp div.st-key-walk-design-result { background: #e8f2ff; border-color: #94b7e2; }\n.stApp [data-testid="stExpander"] > details { background: #f0f6ff; border-color: #b8cce5; }\n.st-key-walk-design-search button { background: #135bb3; color: white; border-color: #135bb3; }\n.st-key-walk-design-search button:hover { background: #0d448d; color: white; }\n.stApp a { color: #124c94; }\n@media (max-width: 640px) {\n    [data-testid="stMainBlockContainer"] { padding-left: .85rem; padding-right: .85rem; }\n    .stApp h1 { font-size: 1.65rem; padding: 1rem; }\n}\n</style>')
 st.html('<style>\n.st-key-walk-design-search [data-testid="stNumberInputStepDown"],\n.st-key-walk-design-search [data-testid="stNumberInputStepUp"],\n.st-key-walk-design-search [data-testid="stNumberInputStepDown"] *,\n.st-key-walk-design-search [data-testid="stNumberInputStepUp"] * {\n    color: #fff !important;\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] button,\n.st-key-walk-design-search [data-testid="stTooltipIcon"] [data-testid="stTooltipHoverTarget"] {\n    background: #f6faff !important;\n    border-color: transparent !important;\n    color: #fff !important;\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] svg.icon,\n.st-key-walk-design-search [data-testid="stTooltipIcon"] svg.icon [stroke]:not([stroke="none"]) {\n    stroke: #fff !important;\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] svg.icon {\n    filter: drop-shadow(0 0 1px #4e75a5) drop-shadow(0 1px 1px #4e75a5);\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] button:focus-visible {\n    outline: 2px solid #4475aa;\n    outline-offset: 2px;\n}\n</style>')
 korean_html(f"<h1>{TITLE}</h1>")
