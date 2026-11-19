@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from difflib import get_close_matches
 from html.parser import HTMLParser
 import os
 import re
@@ -21,16 +20,6 @@ CATALOG_DOWNLOAD_LOCK = Lock()
 
 # Short editorial notes keyed by the exact edition in the library catalog.
 EDITION_NOTES = {
-    "9788964475256": (
-        "농촌 교회가 농사, 복지, 교육을 통해 이웃과 함께 마을 공동체를 돌본 사례를 소개한다.",
-        "https://www.yes24.com/product/goods/78895002",
-        "YES24 상품 페이지 목차 요약",
-    ),
-    "9788952784933": (
-        "할리우드 감독이 나무 집을 영화로 만들러 오고, 기발한 장치가 가득한 집에서 엉뚱한 소동이 벌어진다.",
-        "https://www.yes24.com/product/goods/35244690",
-        "YES24 책 소개 요약",
-    ),
     "9788943312381": (
         "개구리가 가시연잎을 배 삼아 연못에서 바다로 향하고, 거센 물결을 넘으며 낯선 세상을 만난다.",
         "https://www.yes24.com/product/goods/80921650",
@@ -316,35 +305,14 @@ def number_search_text(text):
 
 def search_books(books, query):
     key = normalized(query)
-    if not key:
-        return books, ""
-    indexed = [(book, normalized(book.title), normalized(book.author)) for book in books]
-    matches = [book for book, title, author in indexed if key in title or key in author]
+    matches = [book for book in books if key in normalized(book.title) or key in normalized(book.author)]
     if matches:
         return matches, ""
-    number_query = NUMBER_WITH_COUNTER.search(unicodedata.normalize("NFKC", query))
-    if number_query:
-        query = number_search_text(query)
-        key = normalized(query)
-        indexed = [(book, normalized(number_search_text(book.title)), author) for book, _, author in indexed]
-        matches = [book for book, title, _ in indexed if key in title]
-        if matches:
-            return matches, "숫자 표기도 함께 검색했어요."
-    terms = [term for token in query.split() if (term := normalized(token))]
-    if len(terms) > 1:
-        matches = [book for book, title, author in indexed if all(term in title or term in author for term in terms)]
-        if matches:
-            return matches, ""
-    key = normalized(query)
-    # Keep suggestions for longer titles separate from literal catalog matches.
-    if len(key) >= 5 and not number_query:
-        titles = {title for _, title, _ in indexed if abs(len(title) - len(key)) <= 3}
-        close = get_close_matches(key, sorted(titles), n=5, cutoff=0.82)
-        if close:
-            rank = {title: index for index, title in enumerate(close)}
-            suggestions = sorted((entry for entry in indexed if entry[1] in rank), key=lambda entry: rank[entry[1]])
-            return [book for book, _, _ in suggestions], "제목이 비슷한 책이에요. 찾던 책이 맞는지 확인해 주세요."
-    return [], ""
+    if not NUMBER_WITH_COUNTER.search(unicodedata.normalize("NFKC", query)):
+        return [], ""
+    alternate = number_search_text(query)
+    alternate_key = normalized(alternate)
+    return [book for book in books if alternate_key in normalized(number_search_text(book.title))], alternate
 
 
 FIELD_ALIASES = {
@@ -483,32 +451,16 @@ def google_book_intro(isbn, api_key):
 
 
 def yes24_items(search_type, query, api_key):
-    for attempt in range(2):
-        try:
-            response = requests.get(
-                YES24_BOOK_URL,
-                params={"searchType": search_type, "query": query, "detail": "Y"},
-                headers={"X-Api-Key": api_key.strip()},
-                timeout=(4, 8),
-                allow_redirects=False,
-            )
-        except requests.exceptions.SSLError:
-            raise CatalogError("YES24와 보안 연결을 맺지 못했어요.") from None
-        except (requests.Timeout, requests.ConnectionError):
-            if attempt:
-                raise CatalogError("YES24에 두 번 요청했지만 연결하지 못했어요.") from None
-        except requests.RequestException:
-            raise CatalogError("YES24에 요청을 보낼 수 없어요.") from None
-        else:
-            if response.status_code not in {500, 502, 503, 504} or attempt:
-                break
-        sleep(0.5)
-    if response.status_code == 401:
-        raise CatalogError("YES24가 API 키를 인증하지 못했어요 (HTTP 401).")
-    if response.status_code == 403:
-        raise CatalogError("YES24가 이 API 요청을 거부했어요 (HTTP 403).")
-    if response.status_code == 429:
-        raise CatalogError("YES24 API 요청 한도에 도달했어요 (HTTP 429).")
+    try:
+        response = requests.get(
+            YES24_BOOK_URL,
+            params={"searchType": search_type, "query": query, "detail": "Y"},
+            headers={"X-Api-Key": api_key},
+            timeout=(3, 6),
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise CatalogError("YES24에 연결할 수 없어요.") from None
     if response.status_code == 404:
         return []
     if response.status_code != 200:
@@ -529,21 +481,19 @@ def yes24_book_text(isbn, api_key):
         lookups.append(("ItemId", note[1].rsplit("/", 1)[-1]))
 
     matched_link = ""
-    matched = False
     for search_type, query in lookups:
         for item in yes24_items(search_type, query, api_key):
             if re.sub(r"[\s-]", "", str(item.get("isbn13", ""))) != isbn:
                 continue
-            matched = True
             content = item.get("contentDetail") or {}
             sections = [
-                (label, text)
+                (label, plain_text(content.get(field) or ""))
                 for field, label in (
                     ("bookSummary", "줄거리"),
                     ("bookIntroduction", "책 소개"),
                     ("tableOfContents", "목차"),
                 )
-                if (text := plain_text(content.get(field) or "").strip())
+                if content.get(field)
             ]
             link = item.get("link") or ""
             if not re.fullmatch(r"https://(?:www\.)?yes24\.com/product/goods/\d+/?", link, re.I):
@@ -553,20 +503,20 @@ def yes24_book_text(isbn, api_key):
                     if re.fullmatch(r"[1-9]\d*", item_id)
                     else (note[1] if note else "")
                 )
-            matched_link = link or matched_link
-            if sections:
-                return sections, matched_link, True
-    return [], matched_link, matched
+            if link:
+                matched_link = link
+                if sections:
+                    return sections, link
+    return [], matched_link
 
 
 MOODS = {
     "계절과 자연 관찰": ("계절", "제철", "야생화", "꽃", "정원", "식물", "숲", "자연 관찰", "기후", "생태"),
     "물가와 차분한 사색": ("물결", "바다", "물가", "호수", "하천", "고요", "차분", "잔잔", "휴식", "흐른다", "강가"),
     "역사와 옛 풍경": ("고대", "백제", "역사", "전통", "유적", "문화유산", "옛날", "고고학"),
-    "사랑과 사람 이야기": ("사랑", "우정", "연인", "함께", "가족", "관계", "편지", "행복하다는", "공동체", "마을목회"),
+    "사랑과 사람 이야기": ("사랑", "우정", "연인", "함께", "가족", "관계", "편지", "행복하다는"),
     "도전과 활기": ("도전", "모험", "운동", "달리기", "자전거", "여행", "새로운 시작", "스포츠", "성장", "기발", "엉뚱", "말장난"),
     "기억과 돌아봄": ("추억", "기억", "회고", "철학", "성찰", "되돌아", "사색", "일상"),
-    "문학과 이야기": ("문학기행", "문학여행", "소설", "동화", "시집", "수필", "에세이", "그림책"),
 }
 
 MOOD_ROUTES = {
@@ -576,7 +526,6 @@ MOOD_ROUTES = {
     "사랑과 사람 이야기": "lovers-walk",
     "도전과 활기": "youth-walk",
     "기억과 돌아봄": "memory-walk",
-    "문학과 이야기": "memory-walk",
 }
 
 ROUTE_REASONS = {

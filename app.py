@@ -89,21 +89,17 @@ def update_catalog(snapshot_path):
             CATALOG_DOWNLOAD_LOCK.release()
 
 
-def automatic_book_mood(book, google_key, yes24_key, lookup_status):
+def automatic_book_mood(book, google_key, yes24_key):
     isbn = book_isbn(book)
     cache = st.session_state.setdefault("book_intro_recommendations", {})
-    if not yes24_key:
-        lookup_status.caption("YES24 API 미조회 · API 키가 설정되지 않았어요.")
-    elif not isbn:
-        lookup_status.caption("YES24 API 미조회 · 장서 정보에서 유효한 ISBN을 확인할 수 없어요.")
-    else:
-        cache_key = ("yes24-detail", isbn)
+    if isbn and yes24_key:
+        cache_key = ("yes24", isbn)
         if cache_key not in cache:
             try:
                 with st.spinner("YES24에서 같은 ISBN의 책을 찾고 있어요."):
-                    sections, link, matched = yes24_book_text(isbn, yes24_key)
+                    sections, link = yes24_book_text(isbn, yes24_key)
             except CatalogError as error:
-                lookup_status.caption(f"YES24 API 조회 오류 · {error}")
+                st.caption(str(error))
             else:
                 recommendation = None
                 for label, value in sections:
@@ -111,31 +107,28 @@ def automatic_book_mood(book, google_key, yes24_key, lookup_status):
                     if mood:
                         recommendation = (mood, terms, [label], link, "YES24 도서 정보")
                         break
-                cache[cache_key] = (recommendation, link, matched, bool(sections))
+                cache[cache_key] = (recommendation, link, bool(sections))
         if cache_key in cache:
-            recommendation, link, matched, has_text = cache[cache_key]
+            recommendation, link, has_text = cache[cache_key]
             if recommendation:
-                lookup_status.caption("YES24 API 조회 성공 · 받은 내용을 추천에 사용했어요.")
                 return recommendation
-            if matched:
+            if link:
                 message = (
-                    "소개 자료를 받았지만 추천 기준에 맞는 단서가 없어요."
-                    if has_text else "같은 ISBN의 책을 찾았지만 소개 자료가 비어 있어요."
+                    "YES24 API 응답에서 추천에 쓸 분위기 단서를 찾지 못했어요."
+                    if has_text else "YES24 API의 줄거리·책 소개·목차가 비어 있어요."
                 )
-                lookup_status.caption(f"YES24 API 조회 성공 · {message}")
-                if link and isbn not in EDITION_NOTES:
-                    st.markdown(f"[YES24 상품 페이지 보기]({link})")
+                if isbn in EDITION_NOTES:
+                    st.caption(message)
+                else:
+                    st.markdown(f"{message} [YES24 상품 페이지 보기]({link})")
             else:
-                lookup_status.caption("YES24 API 응답 수신 · 같은 ISBN의 도서가 반환되지 않았어요.")
+                st.caption("YES24 API에서 같은 ISBN의 결과를 받지 못했어요.")
     note = EDITION_NOTES.get(isbn)
     if note:
         mood, terms, _ = infer_mood(Book(title="", description=note[0]))
         if mood:
             return mood, terms, [note[2]], note[1], note[2]
-    mood, terms, sources = infer_mood(book)
-    if mood:
-        return mood, terms, sources, "", "지샘터 도서정보"
-    if isbn and google_key:
+    if not book.description and isbn and google_key:
         cache_key = ("google", isbn)
         if cache_key not in cache:
             try:
@@ -149,7 +142,8 @@ def automatic_book_mood(book, google_key, yes24_key, lookup_status):
             mood, terms, sources = cache[cache_key]
             if mood:
                 return mood, terms, sources, "", "Google Books"
-    return None, [], [], "", ""
+    mood, terms, sources = infer_mood(book)
+    return mood, terms, sources, "", "지샘터 도서정보" if mood else ""
 
 
 def book_option_label(item):
@@ -215,35 +209,34 @@ def show_book_recommendation(folder, demo_books, routes):
             with button_column:
                 st.form_submit_button("검색")
         query = normalized(search_text)
-        matches, search_message = search_books(books, search_text)
-        from_catalog = bool(matches)
-        if from_catalog:
-            if search_message:
-                st.caption(search_message)
-            page_size = 40
-            total_pages = (len(matches) + page_size - 1) // page_size
-            page = 1
-            if total_pages > 1:
-                page = st.number_input("검색 결과 페이지", 1, total_pages, step=1, key=f"page-{query}")
-            start = (page - 1) * page_size
-            visible_books = matches[start:start + page_size]
-            choice_key = f"catalog_book_choice-{query}-{page}"
-            book = st.selectbox(
-                "검색 결과에서 책을 골라 주세요",
-                visible_books,
-                format_func=book_option_label,
-                accept_new_options=True,
-                help="목록에 없는 제목을 입력하고 Enter를 누르면 전체 장서를 검색해요.",
-                key=choice_key,
-            )
-            if isinstance(book, str):
-                st.session_state["pending_catalog_search"] = (book, choice_key)
-                st.rerun()
-            if book is None:
-                st.stop()
-        else:
-            st.caption("장서에 일치하는 책이 없어 입력한 문구로 산책을 추천해요.")
-            book = Book(title=search_text.strip())
+        matches, alternate = search_books(books, search_text)
+        if not matches:
+            st.info("검색 결과가 없어요. 제목이나 저자의 일부를 입력해 보세요.")
+            st.stop()
+        if alternate:
+            st.caption(f"숫자 표기도 함께 검색했어요 · {alternate}")
+
+        page_size = 40
+        total_pages = (len(matches) + page_size - 1) // page_size
+        page = 1
+        if total_pages > 1:
+            page = st.number_input("검색 결과 페이지", 1, total_pages, step=1, key=f"page-{query}")
+        start = (page - 1) * page_size
+        visible_books = matches[start:start + page_size]
+        choice_key = f"catalog_book_choice-{query}-{page}"
+        book = st.selectbox(
+            "검색 결과에서 책을 골라 주세요",
+            visible_books,
+            format_func=book_option_label,
+            accept_new_options=True,
+            help="목록에 없는 제목을 입력하고 Enter를 누르면 전체 장서를 검색해요.",
+            key=choice_key,
+        )
+        if isinstance(book, str):
+            st.session_state["pending_catalog_search"] = (book, choice_key)
+            st.rerun()
+        if book is None:
+            st.stop()
 
     with st.container(border=True, key="walk-design-book"):
         details = [f"<h2>{escape(book.title)}</h2>"]
@@ -261,12 +254,6 @@ def show_book_recommendation(folder, demo_books, routes):
             details.append(f'<p><a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">지샘터 도서정보 보기</a></p>')
         korean_html("".join(details))
 
-    server_yes24_key = os.getenv("YES24_BOOK_API_KEY", "").strip()
-    if not server_yes24_key:
-        try:
-            server_yes24_key = str(st.secrets.get("YES24_BOOK_API_KEY", "")).strip()
-        except st.errors.StreamlitSecretNotFoundError:
-            pass
     with st.expander("책 소개 자동 조회 설정"):
         st.markdown(
             "YES24 키를 연결하면 책을 선택할 때 ISBN으로 줄거리와 책 소개를 찾아요. "
@@ -281,8 +268,6 @@ def show_book_recommendation(folder, demo_books, routes):
 
         if saved_yes24_key:
             st.caption("YES24 키가 이 Windows 계정에 저장되어 있어요.")
-        if server_yes24_key:
-            st.caption("서버에 YES24 키가 설정되어 있어요.")
         with st.form("book_intro_settings", clear_on_submit=True):
             yes24_key = st.text_input(
                 "YES24 API 키", type="password", placeholder="처음 연결하거나 키를 교체할 때 입력"
@@ -318,9 +303,8 @@ def show_book_recommendation(folder, demo_books, routes):
                 st.session_state.pop("yes24_book_api_key", None)
                 st.session_state.pop("book_intro_recommendations", None)
                 st.rerun()
-        lookup_details = st.container()
     yes24_key = (
-        st.session_state.get("yes24_book_api_key") or saved_yes24_key or server_yes24_key
+        st.session_state.get("yes24_book_api_key") or saved_yes24_key or os.getenv("YES24_BOOK_API_KEY", "")
     )
     google_key = st.session_state.get(
         "google_books_api_key",
@@ -337,17 +321,9 @@ def show_book_recommendation(folder, demo_books, routes):
         selected_mood = st.selectbox("산책 분위기", ["책 정보에서 자동 추천", *available_moods])
 
     evidence_url = evidence_name = ""
-    lookup_status = st.empty()
     suggested_mood, terms, sources = infer_mood(book, impression) if impression else (None, [], [])
     if selected_mood not in MOOD_ROUTES and not suggested_mood:
-        if from_catalog:
-            with lookup_details:
-                suggested_mood, terms, sources, evidence_url, evidence_name = automatic_book_mood(
-                    book, google_key, yes24_key, lookup_status
-                )
-        else:
-            suggested_mood, terms, _ = infer_mood(book)
-            sources = ["입력한 문구"] if suggested_mood else []
+        suggested_mood, terms, sources, evidence_url, evidence_name = automatic_book_mood(book, google_key, yes24_key)
     if selected_mood in MOOD_ROUTES:
         feature_id = MOOD_ROUTES[selected_mood]
         reason = f"선택한 분위기 · {selected_mood}. {ROUTE_REASONS[feature_id]}"
@@ -357,7 +333,7 @@ def show_book_recommendation(folder, demo_books, routes):
         reason = f"{evidence}에서 찾은 단서 · {', '.join(terms)}. {ROUTE_REASONS[feature_id]}"
     else:
         feature_id = min(routes, key=lambda key: routes[key][1])
-        reason = "가볍게 시작하는 산책 · 가장 짧은 코스를 제안해요. 원하는 분위기를 선택해 코스를 바꿀 수도 있어요."
+        reason = "기본 코스 · 책 소개나 제목에서 분위기를 판단할 단서가 부족해 가장 짧은 코스를 제안해요."
 
     if evidence_url:
         st.markdown(f"추천에 참고한 자료 · [{evidence_name}]({evidence_url})")
@@ -372,24 +348,7 @@ def cached_catalog(files):
     return read_catalog(files)
 
 
-def show_waypoint_photos(point):
-    name = point["name"]
-    st.markdown(f"**{name}**")
-    photo_folder_name = "몽촌토성" if "몽촌토성" in name else name
-    photo_folder = Path(__file__).resolve().parent / "park_photos" / photo_folder_name
-    if photo_folder.is_dir():
-        photos = sorted(
-            (path for path in photo_folder.iterdir()
-             if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}),
-            key=lambda path: (path.name.casefold(), path.name),
-        )
-        if photos:
-            st.image([str(path) for path in photos], width=320)
-            return
-    st.caption("등록된 사진이 없어요.")
-
-
-def show_map(name, feature_id, coordinates, waypoints):
+def show_map(name, feature_id, coordinates, start_name):
     longitudes, latitudes = zip(*coordinates)
     view = pdk.ViewState(
         longitude=(min(longitudes) + max(longitudes)) / 2,
@@ -407,53 +366,24 @@ def show_map(name, feature_id, coordinates, waypoints):
         width_max_pixels=7,
         cap_rounded=True,
         joint_rounded=True,
+        pickable=True,
     )
     layers = [route_layer]
-    points = {}
-    for waypoint in waypoints:
-        position = waypoint.get("position")
-        if position is None and waypoint["role"] == "start":
-            position = coordinates[0]
-        if position is not None:
-            # A place visited more than once shares one marker.
-            points.setdefault(waypoint["name"], {
-                "name": waypoint["name"],
-                "position": position,
-                "label": str(waypoint["order"]),
-                "color": [191, 64, 35] if waypoint["role"] == "start" else [19, 91, 179],
-            })
-    marker_layer_id = f"{feature_id}-waypoints"
-    if points:
-        st.caption("주황색은 출발점이에요. 번호가 있는 지점을 누르면 지도 아래에서 사진을 볼 수 있어요.")
-        layers.extend([
+    if start_name:
+        layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
-                id=marker_layer_id,
-                data=list(points.values()),
+                id=f"{feature_id}-start",
+                data=[{"name": start_name, "position": coordinates[0]}],
                 get_position="position",
-                get_fill_color="color",
-                radius_units=pdk.types.String("pixels"),
-                get_radius=12,
-                stroked=True,
-                get_line_color=[255, 255, 255],
-                line_width_min_pixels=2,
+                get_fill_color=[230, 88, 45],
+                get_radius=8,
+                radius_min_pixels=8,
                 pickable=True,
-            ),
-            pdk.Layer(
-                "TextLayer",
-                id=f"{feature_id}-waypoint-labels",
-                data=list(points.values()),
-                get_position="position",
-                get_text="label",
-                get_size=12,
-                get_color=[255, 255, 255],
-                font_weight=700,
-                get_text_anchor=pdk.types.String("middle"),
-                get_alignment_baseline=pdk.types.String("center"),
-            ),
-        ])
+            )
+        )
 
-    event = st.pydeck_chart(
+    st.pydeck_chart(
         pdk.Deck(
             layers=layers,
             initial_view_state=view,
@@ -462,31 +392,10 @@ def show_map(name, feature_id, coordinates, waypoints):
         ),
         height=460,
         key=f"map-{feature_id}",
-        on_select="rerun",
-        selection_mode="single-object",
     )
-    selected = event.selection.objects.get(marker_layer_id, [])
-    if selected and (point := points.get(selected[0].get("name"))):
-        show_waypoint_photos(point)
 
 
 st.set_page_config(page_title=TITLE)
-st.html("""
-<style>
-:root, .stApp { color-scheme: only light; }
-.stApp [data-testid="stWidgetLabel"],
-.stApp [data-testid="stWidgetLabel"] p,
-.stApp [data-testid="stRadio"] [role="radiogroup"] p {
-    color: #162d49;
-}
-.stApp [data-baseweb="input"] input::placeholder,
-.stApp [data-baseweb="select"] input::placeholder,
-.stApp [data-baseweb="textarea"] textarea::placeholder {
-    color: #50637b;
-    opacity: 1;
-}
-</style>
-""")
 st.html('<style>\n.stApp, [data-testid="stHeader"] { background: #eceff3; color: #162d49; }\n[data-testid="stMainBlockContainer"] { max-width: 1000px; }\n.stApp h1 { background: #174a86; color: white; border-radius: 16px; padding: 1.35rem 1.6rem; }\n.stApp h2, .stApp h3 { color: #173d68; }\n.stApp div[class*="st-key-walk-design-"] {\n    background: #f6faff; border: 1px solid #b8cce5; border-radius: 16px;\n    box-shadow: 0 3px 12px #1533580a;\n}\n.stApp div.st-key-walk-design-result { background: #e8f2ff; border-color: #94b7e2; }\n.stApp [data-testid="stExpander"] > details { background: #f0f6ff; border-color: #b8cce5; }\n.st-key-walk-design-search button { background: #135bb3; color: white; border-color: #135bb3; }\n.st-key-walk-design-search button:hover { background: #0d448d; color: white; }\n.stApp a { color: #124c94; }\n@media (max-width: 640px) {\n    [data-testid="stMainBlockContainer"] { padding-left: .85rem; padding-right: .85rem; }\n    .stApp h1 { font-size: 1.65rem; padding: 1rem; }\n}\n</style>')
 st.html('<style>\n.st-key-walk-design-search [data-testid="stNumberInputStepDown"],\n.st-key-walk-design-search [data-testid="stNumberInputStepUp"],\n.st-key-walk-design-search [data-testid="stNumberInputStepDown"] *,\n.st-key-walk-design-search [data-testid="stNumberInputStepUp"] * {\n    color: #fff !important;\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] button,\n.st-key-walk-design-search [data-testid="stTooltipIcon"] [data-testid="stTooltipHoverTarget"] {\n    background: #f6faff !important;\n    border-color: transparent !important;\n    color: #fff !important;\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] svg.icon,\n.st-key-walk-design-search [data-testid="stTooltipIcon"] svg.icon [stroke]:not([stroke="none"]) {\n    stroke: #fff !important;\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] svg.icon {\n    filter: drop-shadow(0 0 1px #4e75a5) drop-shadow(0 1px 1px #4e75a5);\n}\n.st-key-walk-design-search [data-testid="stTooltipIcon"] button:focus-visible {\n    outline: 2px solid #4475aa;\n    outline-offset: 2px;\n}\n</style>')
 korean_html(f"<h1>{TITLE}</h1>")
@@ -550,7 +459,7 @@ waypoints = sorted(
     key=lambda point: point["order"],
 )
 start_name = next((point["name"] for point in waypoints if point["role"] == "start"), None)
-stops = [point for point in waypoints if point["role"] in {"start", "via", "featured_stop", "finish"}]
+stops = [point for point in waypoints if point["role"] != "route_description"]
 description = next(
     (point["name"] for point in waypoints if point["role"] == "route_description"),
     None,
@@ -568,8 +477,8 @@ with st.container(border=True, key="walk-design-result"):
     korean_html("".join(summary))
 
 with st.container(border=True, key="walk-design-map"):
-    show_map(name, feature_id, coordinates, waypoints)
-    korean_html("<small>산책로와 지점 표시는 안내용 근사 위치입니다.</small>")
+    show_map(name, feature_id, coordinates, start_name)
+    korean_html("<small>산책로와 출발점은 안내용 근사 위치입니다.</small>")
 
     if stops:
         stop_names = [
