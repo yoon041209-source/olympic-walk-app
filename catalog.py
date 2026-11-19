@@ -491,27 +491,44 @@ def google_book_intro(isbn, api_key):
     return ""
 
 
+def yes24_response(search_type, query, api_key):
+    import httpx
+    import ssl
+
+    params = {"query": query, "detail": "Y"}
+    if search_type != "ISBN13":
+        params["searchType"] = search_type
+    headers = {"X-Api-Key": api_key.strip()} if api_key else {}
+    with httpx.Client(timeout=httpx.Timeout(9, connect=6), follow_redirects=False) as client:
+        for attempt in range(2):
+            try:
+                response = client.get(YES24_BOOK_URL, params=params, headers=headers)
+            except httpx.ProxyError:
+                raise CatalogError("배포 환경의 프록시를 거쳐 YES24에 연결하지 못했어요.") from None
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as error:
+                messages = {
+                    httpx.ConnectTimeout: "YES24 서버에 연결하는 시간이 초과됐어요.",
+                    httpx.ReadTimeout: "YES24 서버의 응답 대기 시간이 초과됐어요.",
+                    httpx.ConnectError: "YES24 서버와 연결을 맺지 못했어요.",
+                    httpx.RemoteProtocolError: "YES24 서버가 응답을 완료하기 전에 연결을 끊었어요.",
+                }
+                cause = error
+                while cause is not None:
+                    if isinstance(cause, ssl.SSLError):
+                        raise CatalogError("YES24와 보안 연결을 맺지 못했어요.") from None
+                    cause = cause.__cause__
+                if attempt:
+                    raise CatalogError(messages[type(error)]) from None
+            except httpx.HTTPError:
+                raise CatalogError("YES24에 요청을 보낼 수 없어요.") from None
+            else:
+                if response.status_code not in {500, 502, 503, 504} or attempt:
+                    return response
+            sleep(0.5)
+
+
 def yes24_items(search_type, query, api_key):
-    for attempt in range(2):
-        try:
-            response = requests.get(
-                YES24_BOOK_URL,
-                params={"searchType": search_type, "query": query, "detail": "Y"},
-                headers={"X-Api-Key": api_key.strip()},
-                timeout=(4, 8),
-                allow_redirects=False,
-            )
-        except requests.exceptions.SSLError:
-            raise CatalogError("YES24와 보안 연결을 맺지 못했어요.") from None
-        except (requests.Timeout, requests.ConnectionError):
-            if attempt:
-                raise CatalogError("YES24에 두 번 요청했지만 연결하지 못했어요.") from None
-        except requests.RequestException:
-            raise CatalogError("YES24에 요청을 보낼 수 없어요.") from None
-        else:
-            if response.status_code not in {500, 502, 503, 504} or attempt:
-                break
-        sleep(0.5)
+    response = yes24_response(search_type, query, api_key)
     if response.status_code == 401:
         raise CatalogError("YES24가 API 키를 인증하지 못했어요 (HTTP 401).")
     if response.status_code == 403:

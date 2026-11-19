@@ -19,6 +19,7 @@ import streamlit as st
 from catalog import Book, MOOD_ROUTES, ROUTE_REASONS, match_route_keywords, normalized, official_book_url, read_catalog
 from catalog import CATALOG_DOWNLOAD_LOCK, CatalogError, clear_checkpoint, pull_catalog, save_catalog
 from catalog import EDITION_NOTES, book_isbn, google_book_intro, yes24_book_text
+from catalog import yes24_items, yes24_response
 from catalog import load_yes24_key, save_yes24_key, yes24_key_path
 from catalog import build_search_index, search_books
 from semantic_routes import MIN_MARGIN, SemanticUnavailable, collect_sentences, load_semantic_model
@@ -154,6 +155,26 @@ def book_option_label(item):
     if isinstance(item, str):
         return item
     return " · ".join(part for part in (item.title, item.author, item.publisher, item.isbn) if part)
+
+
+@st.fragment
+def show_yes24_connection_test(api_key):
+    if not st.button("YES24 서버 연결 테스트"):
+        return
+    isbn = "9788952795090"
+    try:
+        with st.spinner("이 앱 서버에서 YES24에 요청하고 있어요."):
+            if api_key:
+                items = yes24_items("ISBN13", isbn, api_key)
+                if items:
+                    st.success("연결과 키 인증에 성공했고, 테스트 도서가 반환됐어요.")
+                else:
+                    st.info("YES24가 응답했지만 테스트 도서는 반환되지 않았어요.")
+            else:
+                response = yes24_response("ISBN13", isbn, "")
+                st.info(f"YES24가 HTTP {response.status_code}로 응답했어요. 아직 앱에 키가 설정되지 않았어요.")
+    except CatalogError as error:
+        st.warning(str(error))
 
 
 @st.cache_resource(show_spinner=False)
@@ -378,6 +399,8 @@ def show_book_recommendation(folder, demo_books, routes):
     yes24_key = (
         st.session_state.get("yes24_book_api_key") or saved_yes24_key or server_yes24_key
     )
+    with lookup_details:
+        show_yes24_connection_test(yes24_key)
     google_key = st.session_state.get(
         "google_books_api_key",
         os.getenv("GOOGLE_BOOKS_API_KEY", ""),
